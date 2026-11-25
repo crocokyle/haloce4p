@@ -1,0 +1,100 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0). Leave empty for build-only.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build mingw-w64 zip
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Build and run portable unit tests
+        run: |
+          cmake -B build-tests -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+          cmake --build build-tests
+          ctest --test-dir build-tests --output-on-failure
+
+      - name: Cross-compile version.dll (Win64)
+        run: |
+          cmake -B build-win64 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF
+          cmake --build build-win64
+
+      - name: Package drop-in release archive
+        run: |
+          mkdir -p dist
+          cp build-win64/version.dll dist/version.dll
+          cp ce_4player.ini dist/ce_4player.ini
+          cat << 'EOF' > dist/INSTALL.txt
+          Halo: CE 4-Player Co-op Mod (MCC)
+          =================================
+          One package works for both Windows and Linux (Steam Proton).
+
+          1. Copy BOTH files into your MCC Win64 folder:
+             <Halo The Master Chief Collection>/MCC/Binaries/Win64/
+               - version.dll
+               - ce_4player.ini
+
+          2. Launch MCC with Easy Anti-Cheat disabled:
+             - Windows: Choose "Play Halo: MCC (Anti-Cheat Disabled)" in Steam (or pass -no-eac).
+             - Linux (Steam Proton): Set Steam Launch Options to:
+                 WINEDLLOVERRIDES="version=n,b" %command% -no-eac
+
+          3. All co-op players should have version.dll and ce_4player.ini installed.
+          EOF
+
+          TAG_NAME="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          if [ -n "$TAG_NAME" ]; then
+            ARCHIVE_NAME="haloce4p-${TAG_NAME}.zip"
+          else
+            ARCHIVE_NAME="haloce4p-dev.zip"
+          fi
+          (cd dist && zip -r "../${ARCHIVE_NAME}" version.dll ce_4player.ini INSTALL.txt)
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haloce4p-win64
+          path: |
+            dist/version.dll
+            dist/ce_4player.ini
+            ${{ env.ARCHIVE_NAME }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: Halo CE 4-Player Co-op ${{ env.TAG_NAME }}
+          generate_release_notes: true
+          files: |
+            ${{ env.ARCHIVE_NAME }}
+            dist/version.dll
+            dist/ce_4player.ini
