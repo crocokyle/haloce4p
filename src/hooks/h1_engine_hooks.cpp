@@ -39,6 +39,10 @@ constexpr const char* kSigSessionReadyCheck =
 constexpr const char* kSigWaitForPeers =
     "40 53 48 83 EC 20 E8 ? ? ? ? 8B D8 2B 1D ? ? ? ? E8 ? ? ? ? 81 FB C8 AF 00 00";
 
+// halo1.dll: GetNetworkSessionInfo @ 0x180BE9448 (loads c_network_session* at +0x11)
+constexpr const char* kSigNetworkSession =
+    "4C 8B DC 48 83 EC 68 33 C0 38 05 ? ? ? ? 74 66 48 8B 0D";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -69,6 +73,7 @@ const uint32_t* g_session_ready_flag_ptr = nullptr;
 uint32_t g_last_session_ready_logged = 0xFFFFFFFFu;
 const uint32_t* g_expected_peers_ptr = nullptr;
 uint32_t g_last_connected_peers_logged = 0xFFFFFFFFu;
+const uint8_t* const* g_network_session_ptr = nullptr;
 
 using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
@@ -239,6 +244,23 @@ uint64_t __fastcall Hook_InitGameSession(void* a1, void* a2, void* a3, uint32_t 
             static_cast<int>(*coop_count)
         );
     }
+    if (g_network_session_ptr) {
+        const uint8_t* sess = *g_network_session_ptr;
+        if (sess) {
+            uint32_t state = *reinterpret_cast<const uint32_t*>(sess + 0x324B0);
+            uint32_t val_3c = *reinterpret_cast<const uint32_t*>(sess + 0x3C);
+            uint32_t val_40 = *reinterpret_cast<const uint32_t*>(sess + 0x40);
+            uint32_t val_50 = *reinterpret_cast<const uint32_t*>(sess + 0x50);
+            uint32_t mask_54 = *reinterpret_cast<const uint32_t*>(sess + 0x54);
+            uint32_t peers_12f0 = *reinterpret_cast<const uint32_t*>(sess + 0x12F0);
+            uint32_t max_12f4 = *reinterpret_cast<const uint32_t*>(sess + 0x12F4);
+            uint32_t conn = g_fn_get_connected_peers ? g_fn_get_connected_peers() : 0xFFFFFFFFu;
+            CE4P_LOG_INFO(
+                "[H1] NetworkSession: state=%u, +0x3C=%u, +0x40=%u, +0x50=%u, mask=0x%X, +0x12F0=%u, +0x12F4=%u, conn=%u",
+                state, val_3c, val_40, val_50, mask_54, peers_12f0, max_12f4, conn
+            );
+        }
+    }
     return ret;
 }
 
@@ -388,6 +410,14 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             }
         }
     }
+
+    if (!g_network_session_ptr) {
+        if (auto addr = ProbePattern(span, config, "NetworkSession", kSigNetworkSession)) {
+            if (uintptr_t sess_ptr = ResolveRipRelative(*addr + 0x11, 3, 7)) {
+                g_network_session_ptr = reinterpret_cast<const uint8_t* const*>(sess_ptr);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -417,6 +447,7 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_fn_get_connected_peers = nullptr;
     g_expected_peers_ptr = nullptr;
     g_last_connected_peers_logged = 0xFFFFFFFFu;
+    g_network_session_ptr = nullptr;
     if (g_hooked_session_ready) {
         HookManager::Instance().RemoveHook(g_hooked_session_ready);
         g_hooked_session_ready = 0;
