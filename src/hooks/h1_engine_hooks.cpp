@@ -22,12 +22,20 @@ constexpr const char* kSigCampaignPlayerCap =
 constexpr const char* kSigInitGameSession =
     "40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 B0 EE FF FF B8 50 12 00 00";
 
+// halo1.dll: volume_teleport_players_not_inside_impl @ 0x180C57200
+// Resolves players_array (+0x19), object_teleport_to_flag (+0x60), post_teleport (+0x67), datum_next (+0x78)
+constexpr const char* kSigVolumeTeleport =
+    "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 48 89 78 20 41 56 48 83 EC 20 48 8B 1D ? ? ? ? 0F B7 EA";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
 
 constexpr uintptr_t kRvaCoopPlayerCount = 0x01B7B910;
 constexpr uintptr_t kRvaMccGameInterface = 0x02E3B9A0;
+constexpr size_t kPlayerDatumStride = 0xC20;
+constexpr size_t kPlayerDatumUnitOffset = 0x64;
+constexpr size_t kDataArrayOffsetToData = 0x34;
 
 std::mutex g_state_mutex;
 std::optional<ModuleSnapshot> g_active_snapshot;
@@ -35,9 +43,13 @@ PatchRegistry g_h1_patches;
 
 uintptr_t g_h1_base = 0;
 int g_force_test_players = 0;
+bool g_enable_catchup_teleport = true;
 uintptr_t g_hooked_create_engine = 0;
 uintptr_t g_hooked_init_session = 0;
 uintptr_t g_hooked_has_player = 0;
+uintptr_t g_hooked_object_teleport = 0;
+
+const uint8_t* const* g_players_array_ptr = nullptr;
 
 using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
@@ -47,6 +59,64 @@ FnInitGameSession g_orig_init_game_session = nullptr;
 
 using FnHasPlayer = bool(__fastcall*)(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot);
 FnHasPlayer g_orig_has_player = nullptr;
+
+using FnObjectTeleportToFlag = void(__fastcall*)(uint32_t object_index, uint16_t flag_index, bool reset);
+FnObjectTeleportToFlag g_orig_object_teleport_to_flag = nullptr;
+
+using FnPostTeleportReset = void(__fastcall*)(uint32_t object_index);
+FnPostTeleportReset g_fn_post_teleport = nullptr;
+
+using FnDatumArrayNext = int32_t(__fastcall*)(const void* data_array, int32_t prev_datum);
+FnDatumArrayNext g_fn_datum_next = nullptr;
+
+void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_index, bool reset) {
+    g_orig_object_teleport_to_flag(object_index, flag_index, reset);
+
+    static thread_local bool in_catchup = false;
+    if (!g_enable_catchup_teleport || in_catchup || object_index == 0xFFFFFFFF) {
+        return;
+    }
+    if (!g_players_array_ptr || !g_fn_datum_next || !g_fn_post_teleport) {
+        return;
+    }
+    const uint8_t* players_arr = *g_players_array_ptr;
+    if (!players_arr) {
+        return;
+    }
+    int32_t data_off = *reinterpret_cast<const int32_t*>(players_arr + kDataArrayOffsetToData);
+    const uint8_t* data_base = players_arr + data_off;
+
+    int32_t datum = g_fn_datum_next(players_arr, -1);
+    if (datum == -1) {
+        return;
+    }
+    const uint8_t* p0 = data_base + static_cast<size_t>(datum & 0xFFFF) * kPlayerDatumStride;
+    uint32_t p0_unit = *reinterpret_cast<const uint32_t*>(p0 + kPlayerDatumUnitOffset);
+    if (object_index != p0_unit) {
+        return;
+    }
+
+    in_catchup = true;
+    int slot = 1;
+    while ((datum = g_fn_datum_next(players_arr, datum)) != -1) {
+        if (slot >= 2) {
+            const uint8_t* pi = data_base + static_cast<size_t>(datum & 0xFFFF) * kPlayerDatumStride;
+            uint32_t unit_obj = *reinterpret_cast<const uint32_t*>(pi + kPlayerDatumUnitOffset);
+            if (unit_obj != 0xFFFFFFFF && unit_obj != object_index) {
+                g_orig_object_teleport_to_flag(unit_obj, flag_index, reset);
+                g_fn_post_teleport(unit_obj);
+                CE4P_LOG_INFO(
+                    "[H1] CatchupTeleport: player[%d] unit=0x%X -> flag=%u",
+                    slot,
+                    unit_obj,
+                    flag_index
+                );
+            }
+        }
+        ++slot;
+    }
+    in_catchup = false;
+}
 
 bool __fastcall Hook_HasPlayer(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot) {
     bool real = g_orig_has_player(self, a2, a3, a4, slot);
@@ -118,6 +188,7 @@ std::optional<uintptr_t> ProbePattern(MemorySpan span, const ModConfig& config, 
 void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     g_h1_base = snapshot.base;
     g_force_test_players = config.force_test_player_count;
+    g_enable_catchup_teleport = config.enable_catchup_teleport;
 
     MemorySpan span{
         reinterpret_cast<const uint8_t*>(snapshot.base),
@@ -172,6 +243,30 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     ProbePattern(span, config, "LockstepInputBuffer", kSigLockstepInputBuffer);
     ProbePattern(span, config, "GameCreatePlayer", kSigGameCreatePlayer);
     ProbePattern(span, config, "CoopRespawnCheck", kSigCoopRespawnCheck);
+
+    if (!g_hooked_object_teleport) {
+        if (auto vol_tp = ProbePattern(span, config, "VolumeTeleport", kSigVolumeTeleport)) {
+            if (uintptr_t players_ptr = ResolveRipRelative(*vol_tp + 0x19, 3, 7)) {
+                g_players_array_ptr = reinterpret_cast<const uint8_t* const*>(players_ptr);
+            }
+            if (uintptr_t post_tp = ResolveRipRelative(*vol_tp + 0x67, 1, 5)) {
+                g_fn_post_teleport = reinterpret_cast<FnPostTeleportReset>(post_tp);
+            }
+            if (uintptr_t datum_next = ResolveRipRelative(*vol_tp + 0x78, 1, 5)) {
+                g_fn_datum_next = reinterpret_cast<FnDatumArrayNext>(datum_next);
+            }
+            if (uintptr_t obj_tp = ResolveRipRelative(*vol_tp + 0x60, 1, 5)) {
+                if (HookManager::Instance().InstallHook(
+                        "H1::ObjectTeleportToFlag",
+                        obj_tp,
+                        reinterpret_cast<void*>(&Hook_ObjectTeleportToFlag),
+                        reinterpret_cast<void**>(&g_orig_object_teleport_to_flag)
+                    )) {
+                    g_hooked_object_teleport = obj_tp;
+                }
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -193,6 +288,14 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_hooked_object_teleport) {
+        HookManager::Instance().RemoveHook(g_hooked_object_teleport);
+        g_hooked_object_teleport = 0;
+        g_orig_object_teleport_to_flag = nullptr;
+    }
+    g_players_array_ptr = nullptr;
+    g_fn_post_teleport = nullptr;
+    g_fn_datum_next = nullptr;
     if (g_hooked_has_player) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);
         g_hooked_has_player = 0;
