@@ -26,6 +26,10 @@ constexpr const char* kSigLaunchSettingsPlayerCount = "";
 // MCC-Win64-Shipping.exe: $DIALOG_TOO_MANY_REMOTE_PLAYERS gate @ 0x1404B27BF
 // At +0x2E (0x1404B27ED): `83 3D 36 EF B4 03 02` (cmp dword ptr [global], 2)
 constexpr const char* kSigLobbyReadyValidation = "83 FD 01 76 1E 83 FE 02 76 10";
+// MCC-Win64-Shipping.exe: secondary engine_id <= 1 cap @ 0x1404BAE13 (inside 0x1404BAD04)
+// At +0x2E (0x1404BAE41): `41 83 FE 02` (cmp r14d, 2)
+constexpr const char* kSigLobbySecondaryCap =
+    "41 83 FF 01 76 1F 45 84 E4 75 1A 41 83 FD 02 77 20 41 83 FE 04";
 // MCC-Win64-Shipping.exe: Squad::GetTotalPlayerCount() @ 0x14025119C
 constexpr const char* kSigGetTotalPlayerCount =
     "40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? E8 ? ? ? ? 8B 8B 20 0D 00 00 3B C1 0F 47 C8 8B C1";
@@ -188,6 +192,15 @@ void Rescan(const ModConfig& config) {
         // Patch `83 3D 36 EF B4 03 02` (cmp dword ptr [global], 2) -> target_max_players
         g_lobby_patches.PatchByte(
             "LobbyRemotePlayerCap",
+            *addr + 0x2E,
+            static_cast<uint8_t>(config.target_max_players)
+        );
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "LobbySecondaryCap", kSigLobbySecondaryCap)) {
+        // Patch `41 83 FE 02` (cmp r14d, 2) -> target_max_players
+        g_lobby_patches.PatchByte(
+            "LobbySecondaryPlayerCap",
             *addr + 0x2E,
             static_cast<uint8_t>(config.target_max_players)
         );
