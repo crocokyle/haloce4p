@@ -9,6 +9,7 @@ namespace ce4p {
 struct ModConfig {
     bool alloc_console = true;
     int target_max_players = 4;
+    int force_test_player_count = 0;  // 0 = disabled; set to 2..4 for solo multi-player spawn testing
     bool enable_spawn_cloning = true;
     float spawn_clone_radius = 1.25f;
     bool enable_catchup_teleport = true;

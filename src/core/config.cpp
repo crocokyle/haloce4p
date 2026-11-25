@@ -82,6 +82,11 @@ ModConfig ParseConfigText(const std::string& text) {
             if (parsed >= 2 && parsed <= 16) {
                 cfg.target_max_players = parsed;
             }
+        } else if (key == "ForceTestPlayerCount") {
+            int parsed = std::atoi(val.c_str());
+            if (parsed >= 0 && parsed <= 4) {
+                cfg.force_test_player_count = parsed;
+            }
         } else if (key == "EnableSpawnCloning") {
             cfg.enable_spawn_cloning = ParseBool(val, cfg.enable_spawn_cloning);
         } else if (key == "SpawnCloneRadius") {

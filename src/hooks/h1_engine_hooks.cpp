@@ -27,32 +27,66 @@ constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
 
 constexpr uintptr_t kRvaCoopPlayerCount = 0x01B7B910;
+constexpr uintptr_t kRvaMccGameInterface = 0x02E3B9A0;
 
 std::mutex g_state_mutex;
 std::optional<ModuleSnapshot> g_active_snapshot;
 PatchRegistry g_h1_patches;
 
 uintptr_t g_h1_base = 0;
+int g_force_test_players = 0;
 uintptr_t g_hooked_create_engine = 0;
 uintptr_t g_hooked_init_session = 0;
+uintptr_t g_hooked_has_player = 0;
 
-using FnCreateGameEngine = void*(__fastcall*)(void* host);
+using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
 
 using FnInitGameSession = uint64_t(__fastcall*)(void* a1, void* a2, void* a3, uint32_t a4);
 FnInitGameSession g_orig_init_game_session = nullptr;
 
-void* __fastcall Hook_CreateGameEngine(void* host) {
-    void* engine = g_orig_create_game_engine(host);
+using FnHasPlayer = bool(__fastcall*)(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot);
+FnHasPlayer g_orig_has_player = nullptr;
+
+bool __fastcall Hook_HasPlayer(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot) {
+    bool real = g_orig_has_player(self, a2, a3, a4, slot);
+    if (g_force_test_players > 1 && slot < static_cast<uint32_t>(g_force_test_players)) {
+        if (!real) {
+            CE4P_LOG_INFO("[H1] ForceTestPlayerCount: spoofing HasPlayer(slot=%u) -> true", slot);
+        }
+        return true;
+    }
+    return real;
+}
+
+int __fastcall Hook_CreateGameEngine(void** out_engine) {
+    int ret = g_orig_create_game_engine(out_engine);
+    void* engine = out_engine ? *out_engine : nullptr;
     CE4P_LOG_INFO(
-        "[H1] CreateGameEngine(host=0x%llX) -> engine=0x%llX",
-        reinterpret_cast<unsigned long long>(host),
+        "[H1] CreateGameEngine() -> ret=0x%X, engine=0x%llX",
+        ret,
         reinterpret_cast<unsigned long long>(engine)
     );
-    return engine;
+    return ret;
 }
 
 uint64_t __fastcall Hook_InitGameSession(void* a1, void* a2, void* a3, uint32_t a4) {
+    if (g_h1_base && g_force_test_players > 1 && !g_hooked_has_player) {
+        void* iface = *reinterpret_cast<void**>(g_h1_base + kRvaMccGameInterface);
+        if (iface) {
+            uintptr_t* vtable = *reinterpret_cast<uintptr_t**>(iface);
+            uintptr_t target = vtable[0x2C0 / 8];
+            if (HookManager::Instance().InstallHook(
+                    "MCC::HasPlayer",
+                    target,
+                    reinterpret_cast<void*>(&Hook_HasPlayer),
+                    reinterpret_cast<void**>(&g_orig_has_player)
+                )) {
+                g_hooked_has_player = target;
+            }
+        }
+    }
+
     uint64_t ret = g_orig_init_game_session(a1, a2, a3, a4);
     if (g_h1_base) {
         auto* coop_count = reinterpret_cast<const int16_t*>(g_h1_base + kRvaCoopPlayerCount);
@@ -83,6 +117,7 @@ std::optional<uintptr_t> ProbePattern(MemorySpan span, const ModConfig& config, 
 
 void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     g_h1_base = snapshot.base;
+    g_force_test_players = config.force_test_player_count;
 
     MemorySpan span{
         reinterpret_cast<const uint8_t*>(snapshot.base),
@@ -158,6 +193,11 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_hooked_has_player) {
+        HookManager::Instance().RemoveHook(g_hooked_has_player);
+        g_hooked_has_player = 0;
+        g_orig_has_player = nullptr;
+    }
     if (g_hooked_init_session) {
         HookManager::Instance().RemoveHook(g_hooked_init_session);
         g_hooked_init_session = 0;

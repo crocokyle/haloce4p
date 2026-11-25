@@ -13,6 +13,7 @@ void TestConfigParsing() {
 [General]
 AllocConsole = false
 TargetMaxPlayers = 4
+ForceTestPlayerCount = 4
 EnableSpawnCloning = true
 SpawnCloneRadius = 2.5 ; inline comment
 EnableCatchupTeleport = 0
@@ -25,6 +26,7 @@ GameCreatePlayer = 48 89 5C 24 ? 57
     ce4p::ModConfig cfg = ce4p::ParseConfigText(ini);
     assert(!cfg.alloc_console);
     assert(cfg.target_max_players == 4);
+    assert(cfg.force_test_player_count == 4);
     assert(cfg.enable_spawn_cloning);
     assert(std::fabs(cfg.spawn_clone_radius - 2.5f) < 1e-5f);
     assert(!cfg.enable_catchup_teleport);
