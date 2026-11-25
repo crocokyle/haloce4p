@@ -1,10 +1,9 @@
 #include <windows.h>
-#include <mutex>
 
 namespace {
 
 HMODULE g_real_version = nullptr;
-std::once_flag g_init_flag;
+INIT_ONCE g_init_once = INIT_ONCE_STATIC_INIT;
 
 using FnGetFileVersionInfoA = BOOL(WINAPI*)(LPCSTR, DWORD, DWORD, LPVOID);
 using FnGetFileVersionInfoByHandle = BOOL(WINAPI*)(DWORD, HANDLE, DWORD, LPVOID);
@@ -49,36 +48,39 @@ void ResolveExport(T& target, const char* name) {
     target = reinterpret_cast<T>(GetProcAddress(g_real_version, name));
 }
 
+BOOL CALLBACK InitRealVersion(PINIT_ONCE /*init_once*/, PVOID /*param*/, PVOID* /*context*/) {
+    wchar_t sys_dir[MAX_PATH]{};
+    UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH - 16) {
+        return TRUE;
+    }
+    wcscat_s(sys_dir, L"\\version.dll");
+    g_real_version = LoadLibraryW(sys_dir);
+    if (!g_real_version) {
+        return TRUE;
+    }
+    ResolveExport(g_exports.GetFileVersionInfoA, "GetFileVersionInfoA");
+    ResolveExport(g_exports.GetFileVersionInfoByHandle, "GetFileVersionInfoByHandle");
+    ResolveExport(g_exports.GetFileVersionInfoExA, "GetFileVersionInfoExA");
+    ResolveExport(g_exports.GetFileVersionInfoExW, "GetFileVersionInfoExW");
+    ResolveExport(g_exports.GetFileVersionInfoSizeA, "GetFileVersionInfoSizeA");
+    ResolveExport(g_exports.GetFileVersionInfoSizeExA, "GetFileVersionInfoSizeExA");
+    ResolveExport(g_exports.GetFileVersionInfoSizeExW, "GetFileVersionInfoSizeExW");
+    ResolveExport(g_exports.GetFileVersionInfoSizeW, "GetFileVersionInfoSizeW");
+    ResolveExport(g_exports.GetFileVersionInfoW, "GetFileVersionInfoW");
+    ResolveExport(g_exports.VerFindFileA, "VerFindFileA");
+    ResolveExport(g_exports.VerFindFileW, "VerFindFileW");
+    ResolveExport(g_exports.VerInstallFileA, "VerInstallFileA");
+    ResolveExport(g_exports.VerInstallFileW, "VerInstallFileW");
+    ResolveExport(g_exports.VerLanguageNameA, "VerLanguageNameA");
+    ResolveExport(g_exports.VerLanguageNameW, "VerLanguageNameW");
+    ResolveExport(g_exports.VerQueryValueA, "VerQueryValueA");
+    ResolveExport(g_exports.VerQueryValueW, "VerQueryValueW");
+    return TRUE;
+}
+
 void EnsureLoaded() {
-    std::call_once(g_init_flag, []() {
-        wchar_t sys_dir[MAX_PATH]{};
-        UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
-        if (len == 0 || len >= MAX_PATH - 16) {
-            return;
-        }
-        wcscat_s(sys_dir, L"\\version.dll");
-        g_real_version = LoadLibraryW(sys_dir);
-        if (!g_real_version) {
-            return;
-        }
-        ResolveExport(g_exports.GetFileVersionInfoA, "GetFileVersionInfoA");
-        ResolveExport(g_exports.GetFileVersionInfoByHandle, "GetFileVersionInfoByHandle");
-        ResolveExport(g_exports.GetFileVersionInfoExA, "GetFileVersionInfoExA");
-        ResolveExport(g_exports.GetFileVersionInfoExW, "GetFileVersionInfoExW");
-        ResolveExport(g_exports.GetFileVersionInfoSizeA, "GetFileVersionInfoSizeA");
-        ResolveExport(g_exports.GetFileVersionInfoSizeExA, "GetFileVersionInfoSizeExA");
-        ResolveExport(g_exports.GetFileVersionInfoSizeExW, "GetFileVersionInfoSizeExW");
-        ResolveExport(g_exports.GetFileVersionInfoSizeW, "GetFileVersionInfoSizeW");
-        ResolveExport(g_exports.GetFileVersionInfoW, "GetFileVersionInfoW");
-        ResolveExport(g_exports.VerFindFileA, "VerFindFileA");
-        ResolveExport(g_exports.VerFindFileW, "VerFindFileW");
-        ResolveExport(g_exports.VerInstallFileA, "VerInstallFileA");
-        ResolveExport(g_exports.VerInstallFileW, "VerInstallFileW");
-        ResolveExport(g_exports.VerLanguageNameA, "VerLanguageNameA");
-        ResolveExport(g_exports.VerLanguageNameW, "VerLanguageNameW");
-        ResolveExport(g_exports.VerQueryValueA, "VerQueryValueA");
-        ResolveExport(g_exports.VerQueryValueW, "VerQueryValueW");
-    });
+    InitOnceExecuteOnce(&g_init_once, InitRealVersion, nullptr, nullptr);
 }
 
 }  // namespace

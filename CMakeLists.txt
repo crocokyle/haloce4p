@@ -26,6 +26,16 @@ if(WIN32)
     )
     FetchContent_MakeAvailable(minhook)
 
+    if(NOT TARGET minhook)
+        add_library(minhook STATIC
+            ${minhook_SOURCE_DIR}/src/buffer.c
+            ${minhook_SOURCE_DIR}/src/hook.c
+            ${minhook_SOURCE_DIR}/src/trampoline.c
+            ${minhook_SOURCE_DIR}/src/hde/hde64.c
+        )
+        target_include_directories(minhook PUBLIC ${minhook_SOURCE_DIR}/include)
+    endif()
+
     add_library(version SHARED
         src/dllmain.cpp
         src/proxy/version_proxy.cpp
@@ -46,6 +56,7 @@ if(WIN32)
 
     target_include_directories(version PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${minhook_SOURCE_DIR}/include
     )
 
     target_link_libraries(version PRIVATE
@@ -62,6 +73,7 @@ if(WIN32)
 
     if(MINGW)
         target_link_options(version PRIVATE
+            -static
             -static-libgcc
             -static-libstdc++
             -Wl,--enable-stdcall-fixup
