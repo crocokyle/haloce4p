@@ -67,6 +67,7 @@ uintptr_t g_hooked_object_teleport = 0;
 uintptr_t g_hooked_engine_start = 0;
 uintptr_t g_hooked_session_ready = 0;
 uintptr_t g_hooked_wait_for_peers = 0;
+uintptr_t g_hooked_get_connected_peers = 0;
 
 const uint8_t* const* g_players_array_ptr = nullptr;
 const uint32_t* g_session_ready_flag_ptr = nullptr;
@@ -74,6 +75,8 @@ uint32_t g_last_session_ready_logged = 0xFFFFFFFFu;
 const uint32_t* g_expected_peers_ptr = nullptr;
 uint32_t g_last_connected_peers_logged = 0xFFFFFFFFu;
 const uint8_t* const* g_network_session_ptr = nullptr;
+uint32_t g_last_net_state_logged = 0xFFFFFFFFu;
+uint32_t g_last_net_conn_logged = 0xFFFFFFFFu;
 
 using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
@@ -104,6 +107,7 @@ FnWaitForPeers g_orig_wait_for_peers = nullptr;
 
 using FnGetConnectedPeers = uint32_t(__fastcall*)();
 FnGetConnectedPeers g_fn_get_connected_peers = nullptr;
+FnGetConnectedPeers g_orig_get_connected_peers = nullptr;
 
 void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4) {
     if (launch_settings) {
@@ -144,6 +148,31 @@ void __fastcall Hook_WaitForPeers() {
         }
     }
     g_orig_wait_for_peers();
+}
+
+uint32_t __fastcall Hook_GetConnectedPeers() {
+    uint32_t conn = g_orig_get_connected_peers();
+    if (g_network_session_ptr) {
+        const uint8_t* sess = *g_network_session_ptr;
+        if (sess) {
+            uint32_t state = *reinterpret_cast<const uint32_t*>(sess + 0x324B0);
+            if (state != g_last_net_state_logged || conn != g_last_net_conn_logged) {
+                g_last_net_state_logged = state;
+                g_last_net_conn_logged = conn;
+                uint32_t val_3c = *reinterpret_cast<const uint32_t*>(sess + 0x3C);
+                uint32_t val_40 = *reinterpret_cast<const uint32_t*>(sess + 0x40);
+                uint32_t val_50 = *reinterpret_cast<const uint32_t*>(sess + 0x50);
+                uint32_t mask_54 = *reinterpret_cast<const uint32_t*>(sess + 0x54);
+                uint32_t peers_12f0 = *reinterpret_cast<const uint32_t*>(sess + 0x12F0);
+                uint32_t max_12f4 = *reinterpret_cast<const uint32_t*>(sess + 0x12F4);
+                CE4P_LOG_INFO(
+                    "[H1] NetworkSession: state=%u, +0x3C=%u, +0x40=%u, +0x50=%u, mask=0x%X, +0x12F0=%u, +0x12F4=%u, conn=%u",
+                    state, val_3c, val_40, val_50, mask_54, peers_12f0, max_12f4, conn
+                );
+            }
+        }
+    }
+    return conn;
 }
 
 void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_index, bool reset) {
@@ -396,6 +425,16 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
         if (auto addr = ProbePattern(span, config, "WaitForPeers", kSigWaitForPeers)) {
             if (uintptr_t fn_peers = ResolveRipRelative(*addr + 0x13, 1, 5)) {
                 g_fn_get_connected_peers = reinterpret_cast<FnGetConnectedPeers>(fn_peers);
+                if (!g_hooked_get_connected_peers) {
+                    if (HookManager::Instance().InstallHook(
+                            "H1::GetConnectedPeers",
+                            fn_peers,
+                            reinterpret_cast<void*>(&Hook_GetConnectedPeers),
+                            reinterpret_cast<void**>(&g_orig_get_connected_peers)
+                        )) {
+                        g_hooked_get_connected_peers = fn_peers;
+                    }
+                }
             }
             if (uintptr_t exp_ptr = ResolveRipRelative(*addr + 0x4A, 2, 6)) {
                 g_expected_peers_ptr = reinterpret_cast<const uint32_t*>(exp_ptr);
@@ -439,6 +478,13 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_hooked_get_connected_peers) {
+        HookManager::Instance().RemoveHook(g_hooked_get_connected_peers);
+        g_hooked_get_connected_peers = 0;
+        g_orig_get_connected_peers = nullptr;
+    }
+    g_last_net_state_logged = 0xFFFFFFFFu;
+    g_last_net_conn_logged = 0xFFFFFFFFu;
     if (g_hooked_wait_for_peers) {
         HookManager::Instance().RemoveHook(g_hooked_wait_for_peers);
         g_hooked_wait_for_peers = 0;
