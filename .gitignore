@@ -1,0 +1,12 @@
+build/
+build-win64/
+out/
+.vs/
+*.user
+*.suo
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+compile_commands.json

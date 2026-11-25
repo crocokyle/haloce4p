@@ -1,0 +1,11 @@
+# ninja log v7
+1	230	1795586896090097398	CMakeFiles/ce4p_core.dir/src/core/pattern_scanner.cpp.o	e8b2cc6bb50cb5c9
+231	272	1795586896321103581	libce4p_core.a	7b1fa7272eec0aa7
+1	312	1795586896091235925	CMakeFiles/test_pattern_scanner.dir/tests/test_pattern_scanner.cpp.o	6343bc50bb279c28
+312	354	1795586896402604537	test_pattern_scanner	96dd285a8ae58b9a
+1	110	1795586978002395132	CMakeFiles/ce4p_core.dir/src/core/spawn_helper.cpp.o	ffeeccabc38bea3f
+1	296	1795586978002492367	CMakeFiles/test_config_and_spawn.dir/tests/test_config_and_spawn.cpp.o	8da5a61bc050a3a0
+1	382	1795586978001625817	CMakeFiles/ce4p_core.dir/src/core/config.cpp.o	26e9381cff3116d3
+383	414	1795586978383637612	libce4p_core.a	8b8d6a23778c694c
+414	465	1795586978414638569	test_pattern_scanner	96dd285a8ae58b9a
+414	467	1795586978415748484	test_config_and_spawn	9e384956e91561a6

@@ -1,0 +1,6 @@
+/home/croc/code/combatevolved-4player/build-tests/CMakeFiles/ce4p_core.dir
+/home/croc/code/combatevolved-4player/build-tests/CMakeFiles/test_pattern_scanner.dir
+/home/croc/code/combatevolved-4player/build-tests/CMakeFiles/test_config_and_spawn.dir
+/home/croc/code/combatevolved-4player/build-tests/CMakeFiles/test.dir
+/home/croc/code/combatevolved-4player/build-tests/CMakeFiles/edit_cache.dir
+/home/croc/code/combatevolved-4player/build-tests/CMakeFiles/rebuild_cache.dir

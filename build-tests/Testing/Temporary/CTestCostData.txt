@@ -1,0 +1,3 @@
+PatternScannerTests 2 0.000780685
+ConfigAndSpawnTests 1 0.00109383
+---
