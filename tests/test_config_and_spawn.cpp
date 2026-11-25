@@ -14,6 +14,7 @@ void TestConfigParsing() {
 AllocConsole = false
 TargetMaxPlayers = 4
 ForceTestPlayerCount = 4
+ForceTestPartySize = 3
 EnableSpawnCloning = true
 SpawnCloneRadius = 2.5 ; inline comment
 EnableCatchupTeleport = 0
@@ -27,6 +28,7 @@ GameCreatePlayer = 48 89 5C 24 ? 57
     assert(!cfg.alloc_console);
     assert(cfg.target_max_players == 4);
     assert(cfg.force_test_player_count == 4);
+    assert(cfg.force_test_party_size == 3);
     assert(cfg.enable_spawn_cloning);
     assert(std::fabs(cfg.spawn_clone_radius - 2.5f) < 1e-5f);
     assert(!cfg.enable_catchup_teleport);

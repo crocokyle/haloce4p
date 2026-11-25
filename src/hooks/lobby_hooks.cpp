@@ -1,5 +1,7 @@
 #include "hooks/lobby_hooks.hpp"
 
+#include <windows.h>
+
 #include "core/hook_manager.hpp"
 #include "core/logger.hpp"
 #include "core/memory_patch.hpp"
@@ -21,13 +23,20 @@ constexpr const char* kSigGetGameInstance =
     "4C 8B DC 49 89 5B 10 57 48 83 EC 40 48 8B 05 ? ? ? ? 48 33 C4 48 89 44 24 30 44 8B C9 33 FF 48 8B 0D";
 
 constexpr const char* kSigLaunchSettingsPlayerCount = "";
-constexpr const char* kSigLobbyReadyValidation = "";
+// MCC-Win64-Shipping.exe: $DIALOG_TOO_MANY_REMOTE_PLAYERS gate @ 0x1404B27BF
+// At +0x2E (0x1404B27ED): `83 3D 36 EF B4 03 02` (cmp dword ptr [global], 2)
+constexpr const char* kSigLobbyReadyValidation = "83 FD 01 76 1E 83 FE 02 76 10";
+// MCC-Win64-Shipping.exe: Squad::GetTotalPlayerCount() @ 0x14025119C
+constexpr const char* kSigGetTotalPlayerCount =
+    "40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? E8 ? ? ? ? 8B 8B 20 0D 00 00 3B C1 0F 47 C8 8B C1";
 
 constexpr size_t kVtableIdxGetMaxCampaignPlayers = 0x238 / 8;
 
 PatchRegistry g_lobby_patches;
 std::mutex g_lobby_mutex;
 int g_target_max_players = 4;
+int g_force_test_party_size = 0;
+bool g_logged_party_size_spoof = false;
 
 void* g_halo1_instance = nullptr;
 uintptr_t g_hooked_get_max_campaign_players = 0;
@@ -40,6 +49,9 @@ FnGetGameInstance g_orig_get_game_instance = nullptr;
 
 using FnGetMaxCampaignPlayers = int(__fastcall*)(void* self);
 FnGetMaxCampaignPlayers g_orig_get_max_campaign_players = nullptr;
+
+using FnGetTotalPlayerCount = uint32_t(__fastcall*)(void* squad);
+FnGetTotalPlayerCount g_orig_get_total_player_count = nullptr;
 
 bool __fastcall Hook_DeserializeGameDef(void* def, void* json) {
     bool ok = g_orig_deserialize_game_def(def, json);
@@ -92,6 +104,22 @@ void* __fastcall Hook_GetGameInstance(uint32_t engine_id) {
     return inst;
 }
 
+uint32_t __fastcall Hook_GetTotalPlayerCount(void* squad) {
+    uint32_t real_count = g_orig_get_total_player_count(squad);
+    if (g_force_test_party_size > 0) {
+        if (!g_logged_party_size_spoof) {
+            g_logged_party_size_spoof = true;
+            CE4P_LOG_INFO(
+                "[Lobby] Spoofing Squad::GetTotalPlayerCount(): real=%u -> forced=%d",
+                real_count,
+                g_force_test_party_size
+            );
+        }
+        return static_cast<uint32_t>(g_force_test_party_size);
+    }
+    return real_count;
+}
+
 std::optional<uintptr_t> ProbePattern(MemorySpan span, const ModConfig& config, const char* key, const char* fallback) {
     std::string pattern = config.GetSignature(key, fallback);
     if (pattern.empty()) {
@@ -117,6 +145,7 @@ bool Initialize(const ModConfig& config) {
 
 void Rescan(const ModConfig& config) {
     g_target_max_players = config.target_max_players;
+    g_force_test_party_size = config.force_test_party_size;
 
     auto mcc_span = GetModuleTextSpan(nullptr);
     if (!mcc_span.has_value()) {
@@ -154,7 +183,26 @@ void Rescan(const ModConfig& config) {
     }
 
     ProbePattern(*mcc_span, config, "LaunchSettingsPlayerCount", kSigLaunchSettingsPlayerCount);
-    ProbePattern(*mcc_span, config, "LobbyReadyValidation", kSigLobbyReadyValidation);
+
+    if (auto addr = ProbePattern(*mcc_span, config, "LobbyReadyValidation", kSigLobbyReadyValidation)) {
+        // Patch `83 3D 36 EF B4 03 02` (cmp dword ptr [global], 2) -> target_max_players
+        g_lobby_patches.PatchByte(
+            "LobbyRemotePlayerCap",
+            *addr + 0x2E,
+            static_cast<uint8_t>(config.target_max_players)
+        );
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GetTotalPlayerCount", kSigGetTotalPlayerCount)) {
+        if (!g_orig_get_total_player_count) {
+            HookManager::Instance().InstallHook(
+                "Squad::GetTotalPlayerCount",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GetTotalPlayerCount),
+                reinterpret_cast<void**>(&g_orig_get_total_player_count)
+            );
+        }
+    }
 }
 
 void Shutdown() {
