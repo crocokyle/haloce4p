@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <ctime>
 #include <mutex>
+#include <share.h>
 
 namespace ce4p {
 
@@ -50,7 +51,7 @@ void Logger::Init(const std::string& log_path, bool alloc_console) {
     }
 
     if (!g_log_file && !log_path.empty()) {
-        fopen_s(&g_log_file, log_path.c_str(), "w");
+        g_log_file = _fsopen(log_path.c_str(), "w", _SH_DENYNO);
     }
 }
 

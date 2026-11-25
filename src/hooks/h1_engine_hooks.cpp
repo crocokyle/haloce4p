@@ -35,6 +35,10 @@ constexpr const char* kSigIGameEngineStart =
 constexpr const char* kSigSessionReadyCheck =
     "48 83 EC 28 48 8B 0D ? ? ? ? 45 33 C9 45 33 C0 BA F0 00 00 00 FF 15";
 
+// halo1.dll: WaitForPeers (state 8) @ 0x180B26EF0 (45s timeout waiting for connected_peers == expected)
+constexpr const char* kSigWaitForPeers =
+    "40 53 48 83 EC 20 E8 ? ? ? ? 8B D8 2B 1D ? ? ? ? E8 ? ? ? ? 81 FB C8 AF 00 00";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -58,10 +62,13 @@ uintptr_t g_hooked_has_player = 0;
 uintptr_t g_hooked_object_teleport = 0;
 uintptr_t g_hooked_engine_start = 0;
 uintptr_t g_hooked_session_ready = 0;
+uintptr_t g_hooked_wait_for_peers = 0;
 
 const uint8_t* const* g_players_array_ptr = nullptr;
 const uint32_t* g_session_ready_flag_ptr = nullptr;
 uint32_t g_last_session_ready_logged = 0xFFFFFFFFu;
+const uint32_t* g_expected_peers_ptr = nullptr;
+uint32_t g_last_connected_peers_logged = 0xFFFFFFFFu;
 
 using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
@@ -86,6 +93,12 @@ FnIGameEngineStart g_orig_engine_start = nullptr;
 
 using FnSessionReadyCheck = void(__fastcall*)();
 FnSessionReadyCheck g_orig_session_ready_check = nullptr;
+
+using FnWaitForPeers = void(__fastcall*)();
+FnWaitForPeers g_orig_wait_for_peers = nullptr;
+
+using FnGetConnectedPeers = uint32_t(__fastcall*)();
+FnGetConnectedPeers g_fn_get_connected_peers = nullptr;
 
 void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4) {
     if (launch_settings) {
@@ -114,6 +127,18 @@ void __fastcall Hook_SessionReadyCheck() {
             CE4P_LOG_INFO("[H1] SessionReadyCheck -> session_ready_flag=%u", ready);
         }
     }
+}
+
+void __fastcall Hook_WaitForPeers() {
+    if (g_fn_get_connected_peers && g_expected_peers_ptr) {
+        uint32_t conn = g_fn_get_connected_peers();
+        uint32_t exp = *g_expected_peers_ptr;
+        if (conn != g_last_connected_peers_logged) {
+            g_last_connected_peers_logged = conn;
+            CE4P_LOG_INFO("[H1] WaitForPeers: connected=%u, expected=%u", conn, exp);
+        }
+    }
+    g_orig_wait_for_peers();
 }
 
 void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_index, bool reset) {
@@ -344,6 +369,25 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             }
         }
     }
+
+    if (!g_hooked_wait_for_peers) {
+        if (auto addr = ProbePattern(span, config, "WaitForPeers", kSigWaitForPeers)) {
+            if (uintptr_t fn_peers = ResolveRipRelative(*addr + 0x13, 1, 5)) {
+                g_fn_get_connected_peers = reinterpret_cast<FnGetConnectedPeers>(fn_peers);
+            }
+            if (uintptr_t exp_ptr = ResolveRipRelative(*addr + 0x4A, 2, 6)) {
+                g_expected_peers_ptr = reinterpret_cast<const uint32_t*>(exp_ptr);
+            }
+            if (HookManager::Instance().InstallHook(
+                    "H1::WaitForPeers",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_WaitForPeers),
+                    reinterpret_cast<void**>(&g_orig_wait_for_peers)
+                )) {
+                g_hooked_wait_for_peers = *addr;
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -365,6 +409,14 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_hooked_wait_for_peers) {
+        HookManager::Instance().RemoveHook(g_hooked_wait_for_peers);
+        g_hooked_wait_for_peers = 0;
+        g_orig_wait_for_peers = nullptr;
+    }
+    g_fn_get_connected_peers = nullptr;
+    g_expected_peers_ptr = nullptr;
+    g_last_connected_peers_logged = 0xFFFFFFFFu;
     if (g_hooked_session_ready) {
         HookManager::Instance().RemoveHook(g_hooked_session_ready);
         g_hooked_session_ready = 0;
