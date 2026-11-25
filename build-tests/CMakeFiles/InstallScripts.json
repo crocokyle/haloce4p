@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/croc/code/combatevolved-4player/build-tests/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

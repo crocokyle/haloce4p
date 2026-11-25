@@ -1,5 +1,6 @@
 build/
 build-win64/
+build-tests/
 out/
 .vs/
 *.user
