@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
-#include <string>
 
 namespace ce4p::h1 {
 
@@ -53,7 +52,6 @@ PatchRegistry g_h1_patches;
 uintptr_t g_h1_base = 0;
 int g_force_test_players = 0;
 bool g_enable_catchup_teleport = true;
-std::string g_auto_start_mission;
 uintptr_t g_hooked_create_engine = 0;
 uintptr_t g_hooked_init_session = 0;
 uintptr_t g_hooked_has_player = 0;
@@ -206,15 +204,6 @@ uint64_t __fastcall Hook_InitGameSession(void* a1, void* a2, void* a3, uint32_t 
         }
     }
 
-    if (!g_auto_start_mission.empty() && a3) {
-        CE4P_LOG_INFO(
-            "[H1] AutoStartMission: overriding map '%s' -> '%s'",
-            static_cast<const char*>(a3),
-            g_auto_start_mission.c_str()
-        );
-        a3 = const_cast<char*>(g_auto_start_mission.c_str());
-    }
-
     uint64_t ret = g_orig_init_game_session(a1, a2, a3, a4);
     if (g_h1_base) {
         auto* coop_count = reinterpret_cast<const int16_t*>(g_h1_base + kRvaCoopPlayerCount);
@@ -247,7 +236,6 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     g_h1_base = snapshot.base;
     g_force_test_players = config.force_test_player_count;
     g_enable_catchup_teleport = config.enable_catchup_teleport;
-    g_auto_start_mission = config.auto_start_mission;
 
     MemorySpan span{
         reinterpret_cast<const uint8_t*>(snapshot.base),
