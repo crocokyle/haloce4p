@@ -13,6 +13,7 @@ struct ModConfig {
     bool enable_spawn_cloning = true;
     float spawn_clone_radius = 1.25f;
     bool enable_catchup_teleport = true;
+    bool enable_input_automation = false;
 
     // Optional runtime AOB signature overrides loaded from [Signatures] in ce_4player.ini.
     // Allows testing newly discovered signatures without recompiling version.dll.

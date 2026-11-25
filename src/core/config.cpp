@@ -96,6 +96,8 @@ ModConfig ParseConfigText(const std::string& text) {
             }
         } else if (key == "EnableCatchupTeleport") {
             cfg.enable_catchup_teleport = ParseBool(val, cfg.enable_catchup_teleport);
+        } else if (key == "EnableInputAutomation") {
+            cfg.enable_input_automation = ParseBool(val, cfg.enable_input_automation);
         }
     }
 

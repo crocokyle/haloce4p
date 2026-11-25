@@ -2,6 +2,7 @@
 
 #include "core/config.hpp"
 #include "core/hook_manager.hpp"
+#include "core/input_automation.hpp"
 #include "core/logger.hpp"
 #include "core/mod_init.hpp"
 #include "core/module_watcher.hpp"
@@ -17,6 +18,7 @@ namespace {
 
 HMODULE g_self_module = nullptr;
 ce4p::ModuleWatcher g_h1_watcher;
+ce4p::InputAutomation g_input_automation;
 ce4p::ModConfig g_config;
 std::mutex g_config_mutex;
 std::string g_base_dir;
@@ -69,6 +71,10 @@ BOOL CALLBACK DoEarlyInit(PINIT_ONCE /*init_once*/, PVOID /*param*/, PVOID* /*co
         },
         [](const ce4p::ModuleSnapshot& snap) { ce4p::h1::OnModuleUnloaded(snap); }
     );
+
+    if (g_config.enable_input_automation) {
+        g_input_automation.Start(g_base_dir + "ce_4player_input.txt");
+    }
 
     CE4P_LOG_INFO("Early init complete. Watching for halo1.dll...");
     return TRUE;
@@ -130,6 +136,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
         g_init_thread = CreateThread(nullptr, 0, InitializeModThread, hModule, 0, nullptr);
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         g_stop_console = true;
+        g_input_automation.Stop();
         g_h1_watcher.Stop();
         ce4p::lobby::Shutdown();
         ce4p::HookManager::Instance().Shutdown();

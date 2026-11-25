@@ -40,6 +40,7 @@ if(WIN32)
         src/dllmain.cpp
         src/proxy/version_proxy.cpp
         src/proxy/version.def
+        src/core/input_automation.cpp
         src/core/logger.cpp
         src/core/memory_patch.cpp
         src/core/module_watcher.cpp
@@ -63,6 +64,7 @@ if(WIN32)
         ce4p_core
         minhook
         psapi
+        user32
     )
 
     target_compile_definitions(version PRIVATE
