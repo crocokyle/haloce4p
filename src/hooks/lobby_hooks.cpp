@@ -83,23 +83,10 @@ void* __fastcall Hook_GetGameInstance(uint32_t engine_id) {
         std::lock_guard<std::mutex> lock(g_lobby_mutex);
         if (!g_halo1_instance) {
             g_halo1_instance = inst;
-            uintptr_t* vtable = *reinterpret_cast<uintptr_t**>(inst);
-            uintptr_t fn_addr = vtable[kVtableIdxGetMaxCampaignPlayers];
             CE4P_LOG_INFO(
-                "[Lobby] Captured Halo1 GameInstance @ 0x%llX (GetMaxCampaignPlayers @ 0x%llX)",
-                reinterpret_cast<unsigned long long>(inst),
-                static_cast<unsigned long long>(fn_addr)
+                "[Lobby] Captured Halo1 GameContext @ 0x%llX",
+                reinterpret_cast<unsigned long long>(inst)
             );
-            if (!g_hooked_get_max_campaign_players && fn_addr) {
-                if (HookManager::Instance().InstallHook(
-                        "Halo1::GetMaxCampaignPlayers",
-                        fn_addr,
-                        reinterpret_cast<void*>(&Hook_GetMaxCampaignPlayers),
-                        reinterpret_cast<void**>(&g_orig_get_max_campaign_players)
-                    )) {
-                    g_hooked_get_max_campaign_players = fn_addr;
-                }
-            }
         }
     }
     return inst;
