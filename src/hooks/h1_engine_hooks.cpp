@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <string>
 
 namespace ce4p::h1 {
 
@@ -27,6 +28,14 @@ constexpr const char* kSigInitGameSession =
 constexpr const char* kSigVolumeTeleport =
     "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 48 89 78 20 41 56 48 83 EC 20 48 8B 1D ? ? ? ? 0F B7 EA";
 
+// halo1.dll: IGameEngine::vtable[+10] (StartGame) @ 0x1800939D0
+constexpr const char* kSigIGameEngineStart =
+    "40 53 56 57 48 81 EC 50 02 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 40 02 00 00 48 8B 05 ? ? ? ? 49 8B D8";
+
+// halo1.dll: SessionReadyCheck callback @ 0x180080D80 (sets 0x181B7AA80)
+constexpr const char* kSigSessionReadyCheck =
+    "48 83 EC 28 48 8B 0D ? ? ? ? 45 33 C9 45 33 C0 BA F0 00 00 00 FF 15";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -44,12 +53,17 @@ PatchRegistry g_h1_patches;
 uintptr_t g_h1_base = 0;
 int g_force_test_players = 0;
 bool g_enable_catchup_teleport = true;
+std::string g_auto_start_mission;
 uintptr_t g_hooked_create_engine = 0;
 uintptr_t g_hooked_init_session = 0;
 uintptr_t g_hooked_has_player = 0;
 uintptr_t g_hooked_object_teleport = 0;
+uintptr_t g_hooked_engine_start = 0;
+uintptr_t g_hooked_session_ready = 0;
 
 const uint8_t* const* g_players_array_ptr = nullptr;
+const uint32_t* g_session_ready_flag_ptr = nullptr;
+uint32_t g_last_session_ready_logged = 0xFFFFFFFFu;
 
 using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
@@ -68,6 +82,41 @@ FnPostTeleportReset g_fn_post_teleport = nullptr;
 
 using FnDatumArrayNext = int32_t(__fastcall*)(const void* data_array, int32_t prev_datum);
 FnDatumArrayNext g_fn_datum_next = nullptr;
+
+using FnIGameEngineStart = void(__fastcall*)(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4);
+FnIGameEngineStart g_orig_engine_start = nullptr;
+
+using FnSessionReadyCheck = void(__fastcall*)();
+FnSessionReadyCheck g_orig_session_ready_check = nullptr;
+
+void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4) {
+    if (launch_settings) {
+        uint8_t f0 = launch_settings[0];
+        uint8_t f2 = launch_settings[2];
+        uint32_t mode = *reinterpret_cast<const uint32_t*>(launch_settings + 0x0C);
+        int16_t map_id = *reinterpret_cast<const int16_t*>(launch_settings + 0x14);
+        uint32_t submode = *reinterpret_cast<const uint32_t*>(launch_settings + 0xE8);
+        uint32_t f2f0 = *reinterpret_cast<const uint32_t*>(launch_settings + 0x2F0);
+        CE4P_LOG_INFO(
+            "[H1] IGameEngineStart(f0=0x%02X, f2=0x%02X, mode=%u, map_id=%d, +0xE8=%u, +0x2F0=%u)",
+            f0, f2, mode, static_cast<int>(map_id), submode, f2f0
+        );
+    } else {
+        CE4P_LOG_INFO("[H1] IGameEngineStart(launch_settings=null)");
+    }
+    g_orig_engine_start(self, mcc_iface, launch_settings, a4);
+}
+
+void __fastcall Hook_SessionReadyCheck() {
+    g_orig_session_ready_check();
+    if (g_session_ready_flag_ptr) {
+        uint32_t ready = *g_session_ready_flag_ptr;
+        if (ready != g_last_session_ready_logged) {
+            g_last_session_ready_logged = ready;
+            CE4P_LOG_INFO("[H1] SessionReadyCheck -> session_ready_flag=%u", ready);
+        }
+    }
+}
 
 void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_index, bool reset) {
     g_orig_object_teleport_to_flag(object_index, flag_index, reset);
@@ -157,6 +206,15 @@ uint64_t __fastcall Hook_InitGameSession(void* a1, void* a2, void* a3, uint32_t 
         }
     }
 
+    if (!g_auto_start_mission.empty() && a3) {
+        CE4P_LOG_INFO(
+            "[H1] AutoStartMission: overriding map '%s' -> '%s'",
+            static_cast<const char*>(a3),
+            g_auto_start_mission.c_str()
+        );
+        a3 = const_cast<char*>(g_auto_start_mission.c_str());
+    }
+
     uint64_t ret = g_orig_init_game_session(a1, a2, a3, a4);
     if (g_h1_base) {
         auto* coop_count = reinterpret_cast<const int16_t*>(g_h1_base + kRvaCoopPlayerCount);
@@ -189,6 +247,7 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     g_h1_base = snapshot.base;
     g_force_test_players = config.force_test_player_count;
     g_enable_catchup_teleport = config.enable_catchup_teleport;
+    g_auto_start_mission = config.auto_start_mission;
 
     MemorySpan span{
         reinterpret_cast<const uint8_t*>(snapshot.base),
@@ -267,6 +326,36 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             }
         }
     }
+
+    if (!g_hooked_engine_start) {
+        if (auto addr = ProbePattern(span, config, "IGameEngineStart", kSigIGameEngineStart)) {
+            if (HookManager::Instance().InstallHook(
+                    "H1::IGameEngineStart",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_IGameEngineStart),
+                    reinterpret_cast<void**>(&g_orig_engine_start)
+                )) {
+                g_hooked_engine_start = *addr;
+            }
+        }
+    }
+
+    if (!g_hooked_session_ready) {
+        if (auto addr = ProbePattern(span, config, "SessionReadyCheck", kSigSessionReadyCheck)) {
+            // At +0x35: `44 89 05 [disp32]` writing session_ready_flag (0x181B7AA80)
+            if (uintptr_t flag_ptr = ResolveRipRelative(*addr + 0x35, 3, 7)) {
+                g_session_ready_flag_ptr = reinterpret_cast<const uint32_t*>(flag_ptr);
+            }
+            if (HookManager::Instance().InstallHook(
+                    "H1::SessionReadyCheck",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_SessionReadyCheck),
+                    reinterpret_cast<void**>(&g_orig_session_ready_check)
+                )) {
+                g_hooked_session_ready = *addr;
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -288,6 +377,18 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_hooked_session_ready) {
+        HookManager::Instance().RemoveHook(g_hooked_session_ready);
+        g_hooked_session_ready = 0;
+        g_orig_session_ready_check = nullptr;
+    }
+    g_session_ready_flag_ptr = nullptr;
+    g_last_session_ready_logged = 0xFFFFFFFFu;
+    if (g_hooked_engine_start) {
+        HookManager::Instance().RemoveHook(g_hooked_engine_start);
+        g_hooked_engine_start = 0;
+        g_orig_engine_start = nullptr;
+    }
     if (g_hooked_object_teleport) {
         HookManager::Instance().RemoveHook(g_hooked_object_teleport);
         g_hooked_object_teleport = 0;
