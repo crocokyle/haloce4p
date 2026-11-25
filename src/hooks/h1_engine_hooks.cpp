@@ -11,15 +11,24 @@ namespace ce4p::h1 {
 
 namespace {
 
+// halo1.dll: Co-op/local player count cap in game initialization.
+// 75 08 41 83 FD [02] 7F 08 EB 28 41 83 FD 04 7E 22
+// At +5 is the immediate `2` in `cmp r13d, 2` for campaign mode.
+constexpr const char* kSigCampaignPlayerCap =
+    "75 08 41 83 FD 02 7F 08 EB 28 41 83 FD 04 7E 22";
+constexpr const char* kSigLockstepInputBuffer = "";
+constexpr const char* kSigGameCreatePlayer = "";
+constexpr const char* kSigCoopRespawnCheck = "";
+
 std::mutex g_state_mutex;
 std::optional<ModuleSnapshot> g_active_snapshot;
 PatchRegistry g_h1_patches;
 
-void ProbePattern(MemorySpan span, const ModConfig& config, const char* key) {
-    std::string pattern = config.GetSignature(key, "");
+std::optional<uintptr_t> ProbePattern(MemorySpan span, const ModConfig& config, const char* key, const char* fallback) {
+    std::string pattern = config.GetSignature(key, fallback);
     if (pattern.empty()) {
         CE4P_LOG_DEBUG("[H1] Signature '%s' not yet populated.", key);
-        return;
+        return std::nullopt;
     }
     auto match = FindPattern(span, pattern);
     if (match.has_value()) {
@@ -27,6 +36,7 @@ void ProbePattern(MemorySpan span, const ModConfig& config, const char* key) {
     } else {
         CE4P_LOG_WARN("[H1] Pattern NOT found for '%s'.", key);
     }
+    return match;
 }
 
 void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
@@ -36,16 +46,26 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     };
 
     CE4P_LOG_INFO(
-        "[H1] Probing halo1.dll (timestamp=0x%08X, spawn_cloning=%s, radius=%.2f)...",
+        "[H1] Probing halo1.dll (timestamp=0x%08X, target_players=%d, spawn_cloning=%s, radius=%.2f)...",
         snapshot.pe_timestamp,
+        config.target_max_players,
         config.enable_spawn_cloning ? "on" : "off",
         config.spawn_clone_radius
     );
 
-    ProbePattern(span, config, "CampaignPlayerCap");
-    ProbePattern(span, config, "LockstepInputBuffer");
-    ProbePattern(span, config, "GameCreatePlayer");
-    ProbePattern(span, config, "CoopRespawnCheck");
+    if (auto addr = ProbePattern(span, config, "CampaignPlayerCap", kSigCampaignPlayerCap)) {
+        if (g_h1_patches.Count() == 0 && config.target_max_players > 2) {
+            g_h1_patches.PatchByte(
+                "CampaignPlayerCap",
+                *addr + 5,
+                static_cast<uint8_t>(config.target_max_players)
+            );
+        }
+    }
+
+    ProbePattern(span, config, "LockstepInputBuffer", kSigLockstepInputBuffer);
+    ProbePattern(span, config, "GameCreatePlayer", kSigGameCreatePlayer);
+    ProbePattern(span, config, "CoopRespawnCheck", kSigCoopRespawnCheck);
 }
 
 }  // namespace

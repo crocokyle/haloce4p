@@ -140,6 +140,32 @@ std::optional<MemorySpan> GetModuleSpan(const char* module_name) {
         static_cast<size_t>(info.SizeOfImage),
     };
 }
+
+std::optional<MemorySpan> GetModuleTextSpan(const char* module_name) {
+    HMODULE mod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(nullptr);
+    if (!mod) {
+        return std::nullopt;
+    }
+    const auto* base = reinterpret_cast<const uint8_t*>(mod);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return GetModuleSpan(module_name);
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return GetModuleSpan(module_name);
+    }
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (std::memcmp(sec->Name, ".text", 5) == 0) {
+            return MemorySpan{
+                base + sec->VirtualAddress,
+                static_cast<size_t>(sec->Misc.VirtualSize),
+            };
+        }
+    }
+    return GetModuleSpan(module_name);
+}
 #endif
 
 }  // namespace ce4p

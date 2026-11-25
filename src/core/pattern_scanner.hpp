@@ -37,6 +37,9 @@ uintptr_t ResolveRipRelative(uintptr_t instruction_addr, size_t disp_offset, siz
 #ifdef _WIN32
 // Returns the full image span of a loaded Windows module (PE SizeOfImage).
 std::optional<MemorySpan> GetModuleSpan(const char* module_name);
+
+// Returns the .text section span of a loaded Windows module (faster and safer for code scans).
+std::optional<MemorySpan> GetModuleTextSpan(const char* module_name);
 #endif
 
 }  // namespace ce4p
