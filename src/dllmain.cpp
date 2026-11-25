@@ -3,6 +3,7 @@
 #include "core/config.hpp"
 #include "core/hook_manager.hpp"
 #include "core/logger.hpp"
+#include "core/mod_init.hpp"
 #include "core/module_watcher.hpp"
 #include "hooks/h1_engine_hooks.hpp"
 #include "hooks/lobby_hooks.hpp"
@@ -14,11 +15,13 @@
 
 namespace {
 
+HMODULE g_self_module = nullptr;
 ce4p::ModuleWatcher g_h1_watcher;
 ce4p::ModConfig g_config;
 std::mutex g_config_mutex;
 std::string g_base_dir;
 HANDLE g_init_thread = nullptr;
+INIT_ONCE g_early_init_once = INIT_ONCE_STATIC_INIT;
 volatile bool g_stop_console = false;
 
 std::string GetModuleDir(HMODULE self) {
@@ -33,6 +36,42 @@ std::string GetModuleDir(HMODULE self) {
         return "";
     }
     return full.substr(0, slash + 1);
+}
+
+BOOL CALLBACK DoEarlyInit(PINIT_ONCE /*init_once*/, PVOID /*param*/, PVOID* /*context*/) {
+    g_base_dir = GetModuleDir(g_self_module);
+
+    {
+        std::lock_guard<std::mutex> lock(g_config_mutex);
+        g_config = ce4p::LoadConfigFile(g_base_dir + "ce_4player.ini");
+    }
+
+    ce4p::Logger::Instance().Init(g_base_dir + "ce_4player.log", g_config.alloc_console);
+    CE4P_LOG_INFO("====================================================");
+    CE4P_LOG_INFO("Halo: CE 4-Player Co-op Mod (Diagnostic Proxy) v0.1");
+    CE4P_LOG_INFO("====================================================");
+
+    if (!ce4p::HookManager::Instance().Initialize()) {
+        CE4P_LOG_ERROR("HookManager initialization failed; aborting hook setup.");
+        return TRUE;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_config_mutex);
+        ce4p::lobby::Initialize(g_config);
+    }
+
+    g_h1_watcher.Start(
+        "halo1.dll",
+        [](const ce4p::ModuleSnapshot& snap) {
+            std::lock_guard<std::mutex> lock(g_config_mutex);
+            ce4p::h1::OnModuleLoaded(snap, g_config);
+        },
+        [](const ce4p::ModuleSnapshot& snap) { ce4p::h1::OnModuleUnloaded(snap); }
+    );
+
+    CE4P_LOG_INFO("Early init complete. Watching for halo1.dll...");
+    return TRUE;
 }
 
 void RunConsoleCommandLoop() {
@@ -66,41 +105,8 @@ void RunConsoleCommandLoop() {
     }
 }
 
-DWORD WINAPI InitializeModThread(LPVOID param) {
-    auto self = static_cast<HMODULE>(param);
-    g_base_dir = GetModuleDir(self);
-
-    {
-        std::lock_guard<std::mutex> lock(g_config_mutex);
-        g_config = ce4p::LoadConfigFile(g_base_dir + "ce_4player.ini");
-    }
-
-    ce4p::Logger::Instance().Init(g_base_dir + "ce_4player.log", g_config.alloc_console);
-    CE4P_LOG_INFO("====================================================");
-    CE4P_LOG_INFO("Halo: CE 4-Player Co-op Mod (Diagnostic Proxy) v0.1");
-    CE4P_LOG_INFO("====================================================");
-
-    if (!ce4p::HookManager::Instance().Initialize()) {
-        CE4P_LOG_ERROR("HookManager initialization failed; aborting hook setup.");
-        return 1;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_config_mutex);
-        ce4p::lobby::Initialize(g_config);
-    }
-
-    g_h1_watcher.Start(
-        "halo1.dll",
-        [](const ce4p::ModuleSnapshot& snap) {
-            std::lock_guard<std::mutex> lock(g_config_mutex);
-            ce4p::h1::OnModuleLoaded(snap, g_config);
-        },
-        [](const ce4p::ModuleSnapshot& snap) { ce4p::h1::OnModuleUnloaded(snap); }
-    );
-
-    CE4P_LOG_INFO("Mod initialization complete. Watching for halo1.dll...");
-
+DWORD WINAPI InitializeModThread(LPVOID /*param*/) {
+    ce4p::EnsureEarlyInit();
     if (g_config.alloc_console) {
         RunConsoleCommandLoop();
     }
@@ -109,8 +115,17 @@ DWORD WINAPI InitializeModThread(LPVOID param) {
 
 }  // namespace
 
+namespace ce4p {
+
+void EnsureEarlyInit() {
+    InitOnceExecuteOnce(&g_early_init_once, DoEarlyInit, nullptr, nullptr);
+}
+
+}  // namespace ce4p
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        g_self_module = hModule;
         DisableThreadLibraryCalls(hModule);
         g_init_thread = CreateThread(nullptr, 0, InitializeModThread, hModule, 0, nullptr);
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {

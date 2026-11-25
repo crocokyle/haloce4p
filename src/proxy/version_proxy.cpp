@@ -1,5 +1,7 @@
 #include <windows.h>
 
+#include "core/mod_init.hpp"
+
 namespace {
 
 HMODULE g_real_version = nullptr;
@@ -81,6 +83,7 @@ BOOL CALLBACK InitRealVersion(PINIT_ONCE /*init_once*/, PVOID /*param*/, PVOID* 
 
 void EnsureLoaded() {
     InitOnceExecuteOnce(&g_init_once, InitRealVersion, nullptr, nullptr);
+    ce4p::EnsureEarlyInit();
 }
 
 }  // namespace
