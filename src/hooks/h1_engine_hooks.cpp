@@ -55,6 +55,18 @@ constexpr const char* kSigServerAcceptClient =
 constexpr const char* kSigServerValidateClient =
     "48 89 5C 24 08 57 48 83 EC 20 33 DB 48 8B F9 48 85 D2 74 05 48 8B 0A EB";
 
+// halo1.dll: MatchMake_campaign_net @ 0x180065F70 (loads net_active at +0x42, is_host at +0x4F)
+constexpr const char* kSigMatchMakeCampaignNet =
+    "48 8B C4 55 41 54 41 55 41 56 41 57 48 8D A8 C8 FC FF FF 48 81 EC 10 04 00 00 "
+    "48 C7 45 18 FE FF FF FF 48 89 58 08 48 89 70 18 48 89 78 20 "
+    "48 8B 05 ? ? ? ? 48 33 C4 48 89 85 00 03 00 00 48 8B DA "
+    "83 3D ? ? ? ? 00 0F 84 ? ? ? ? 83 3D ? ? ? ? 00 41 0F 95 C5";
+
+// halo1.dll: MatchMake_campaign_net peer channel wait cap @ 0x1800664BC
+// 83 BF 28 01 00 00 [02] 0F 8D -> cmp dword ptr [rdi+0x128], 2; jge ...
+constexpr const char* kSigMatchMakePeerCap =
+    "83 BF 28 01 00 00 02 0F 8D";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -87,7 +99,12 @@ uintptr_t g_hooked_get_connected_peers = 0;
 uintptr_t g_hooked_client_handshake = 0;
 uintptr_t g_hooked_server_accept = 0;
 uintptr_t g_hooked_server_validate = 0;
+uintptr_t g_hooked_matchmake_campaign_net = 0;
+uintptr_t g_matchmake_peer_cmp_addr = 0;
+int g_launch_expected_players = 0;
 
+const uint32_t* g_net_active_ptr = nullptr;
+const uint32_t* g_is_host_ptr = nullptr;
 const uint8_t* const* g_players_array_ptr = nullptr;
 const uint32_t* g_session_ready_flag_ptr = nullptr;
 uint32_t g_last_session_ready_logged = 0xFFFFFFFFu;
@@ -119,6 +136,9 @@ FnDatumArrayNext g_fn_datum_next = nullptr;
 
 using FnIGameEngineStart = void(__fastcall*)(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4);
 FnIGameEngineStart g_orig_engine_start = nullptr;
+
+using FnMatchMakeCampaignNet = uint64_t(__fastcall*)(void* a1, void* a2, void* a3, void* a4);
+FnMatchMakeCampaignNet g_orig_matchmake_campaign_net = nullptr;
 
 using FnSessionReadyCheck = void(__fastcall*)();
 FnSessionReadyCheck g_orig_session_ready_check = nullptr;
@@ -223,15 +243,54 @@ void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t
         int16_t map_id = *reinterpret_cast<const int16_t*>(launch_settings + 0x14);
         uint32_t submode = *reinterpret_cast<const uint32_t*>(launch_settings + 0xE8);
         uint32_t f2f0 = *reinterpret_cast<const uint32_t*>(launch_settings + 0x2F0);
+        g_launch_expected_players = static_cast<int>(submode);
         CE4P_LOG_INFO(
             "[H1] IGameEngineStart(f0=0x%02X, f2=0x%02X, mode=%u, map_id=%d, +0xE8=%u, +0x2F0=%u)",
             f0, f2, mode, static_cast<int>(map_id), submode, f2f0
         );
     } else {
+        g_launch_expected_players = 0;
         CE4P_LOG_INFO("[H1] IGameEngineStart(launch_settings=null)");
     }
     g_last_client_hs_key = 0xFFFFFFFFFFFFFFFFull;
     g_orig_engine_start(self, mcc_iface, launch_settings, a4);
+}
+
+void WritePeerCapByte(uintptr_t cmp_addr, uint8_t value) {
+    if (!cmp_addr) {
+        return;
+    }
+    auto* target = reinterpret_cast<uint8_t*>(cmp_addr + 6);
+    if (*target == value) {
+        return;
+    }
+    DWORD old_protect = 0;
+    if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        *target = value;
+        DWORD dummy = 0;
+        VirtualProtect(target, 1, old_protect, &dummy);
+        FlushInstructionCache(GetCurrentProcess(), target, 1);
+    }
+}
+
+uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void* a4) {
+    uint32_t net_active = g_net_active_ptr ? *g_net_active_ptr : 0;
+    uint32_t is_host = g_is_host_ptr ? *g_is_host_ptr : 0;
+    uint8_t desired = 2;
+    if (is_host != 0 && net_active != 0 && g_launch_expected_players >= 2 && g_launch_expected_players <= 4) {
+        desired = static_cast<uint8_t>(g_launch_expected_players);
+    }
+    WritePeerCapByte(g_matchmake_peer_cmp_addr, desired);
+    CE4P_LOG_INFO(
+        "[H1] MatchMake_campaign_net(is_host=%u, net_active=%u, launch_players=%d) -> wait_cap=%u",
+        is_host,
+        net_active,
+        g_launch_expected_players,
+        static_cast<unsigned>(desired)
+    );
+    uint64_t ret = g_orig_matchmake_campaign_net(a1, a2, a3, a4);
+    CE4P_LOG_INFO("[H1] MatchMake_campaign_net returned");
+    return ret;
 }
 
 void __fastcall Hook_SessionReadyCheck() {
@@ -613,6 +672,31 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             }
         }
     }
+
+    if (!g_matchmake_peer_cmp_addr) {
+        if (auto addr = ProbePattern(span, config, "MatchMakePeerCap", kSigMatchMakePeerCap)) {
+            g_matchmake_peer_cmp_addr = *addr;
+        }
+    }
+
+    if (!g_hooked_matchmake_campaign_net) {
+        if (auto addr = ProbePattern(span, config, "MatchMakeCampaignNet", kSigMatchMakeCampaignNet)) {
+            if (uintptr_t net_ptr = ResolveRipRelative(*addr + 0x42, 2, 7)) {
+                g_net_active_ptr = reinterpret_cast<const uint32_t*>(net_ptr);
+            }
+            if (uintptr_t host_ptr = ResolveRipRelative(*addr + 0x4F, 2, 7)) {
+                g_is_host_ptr = reinterpret_cast<const uint32_t*>(host_ptr);
+            }
+            if (HookManager::Instance().InstallHook(
+                    "H1::MatchMakeCampaignNet",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_MatchMakeCampaignNet),
+                    reinterpret_cast<void**>(&g_orig_matchmake_campaign_net)
+                )) {
+                g_hooked_matchmake_campaign_net = *addr;
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -634,6 +718,18 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_matchmake_peer_cmp_addr) {
+        WritePeerCapByte(g_matchmake_peer_cmp_addr, 2);
+        g_matchmake_peer_cmp_addr = 0;
+    }
+    if (g_hooked_matchmake_campaign_net) {
+        HookManager::Instance().RemoveHook(g_hooked_matchmake_campaign_net);
+        g_hooked_matchmake_campaign_net = 0;
+        g_orig_matchmake_campaign_net = nullptr;
+    }
+    g_net_active_ptr = nullptr;
+    g_is_host_ptr = nullptr;
+    g_launch_expected_players = 0;
     if (g_hooked_server_validate) {
         HookManager::Instance().RemoveHook(g_hooked_server_validate);
         g_hooked_server_validate = 0;
