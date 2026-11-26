@@ -211,6 +211,7 @@ uintptr_t g_hooked_server_validate = 0;
 uintptr_t g_hooked_matchmake_campaign_net = 0;
 std::atomic<bool> g_init_session_entered{false};
 uintptr_t g_hooked_has_channel_for_slot = 0;
+std::atomic<int> g_slot2_log_budget{8};
 uint8_t g_hold_desired = 0;
 uint64_t g_hold_until_ms = 0;
 uintptr_t g_matchmake_peer_cmp_addr = 0;
@@ -283,9 +284,9 @@ FnObjectSetPosition g_fn_object_set_position = nullptr;
 const uint8_t* const* g_object_header_array_ptr = nullptr;
 const uint8_t* const* g_object_pool_ptr = nullptr;
 char g_current_map_name[32]{};
-bool g_opening_seat_eject_done = false;
-bool g_p0_ever_on_foot = false;
-int32_t g_p1_on_foot_ticks = 0;
+bool g_opening_eject_done[4]{};
+bool g_player_ever_on_foot[4]{};
+int32_t g_player_stuck_ticks[4]{};
 int32_t g_opening_diag_ticks = 0;
 
 bool GetUnitSeatAndPos(uint32_t unit_datum, uint32_t& out_parent, int16_t& out_seat, float out_pos[3]) {
@@ -562,8 +563,7 @@ bool __fastcall Hook_HasChannelForSlot(void* transport, int32_t slot) {
     }
     const bool res = g_orig_has_channel_for_slot(transport, slot * 2);
     if (slot >= 2) {
-        static std::atomic<int> slot2_log_budget{8};
-        if (slot2_log_budget.fetch_sub(1) > 0) {
+        if (g_slot2_log_budget.fetch_sub(1) > 0) {
             const auto* s0 = reinterpret_cast<const uint8_t*>(transport);
             const int32_t chans = s0 ? *reinterpret_cast<const int32_t*>(s0 + 0x128) : -1;
             const uint8_t* t0 = s0 ? *reinterpret_cast<const uint8_t* const*>(s0 + 0x30) : nullptr;
@@ -1781,55 +1781,65 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
         }
     }
 
-    // Deterministic opening-seat fix (a10 cryotube, a50 Pelican, etc.): if Player 0
-    // has never been on foot yet and remains seated while Player 1 is on foot for 1.5s (45 ticks),
-    // force-eject Player 0 and move them next to Player 1 identically on all peers.
-    if (!g_p0_ever_on_foot && !g_opening_seat_eject_done && (*valid_mask_ptr & 0x1u) != 0 &&
-        g_fn_unit_exit_seat_force && g_players_array_ptr && g_fn_datum_next) {
+    // Deterministic opening-seat fix (a10 cryotube, a50/c10 Pelican, etc.): for any player 0..3
+    // who has never been on foot yet and remains seated while at least one other player is on foot
+    // for 1.5s (45 ticks), force-eject them and move them next to the on-foot player identically on all peers.
+    if ((*valid_mask_ptr & 0x1u) != 0 && g_fn_unit_exit_seat_force && g_players_array_ptr && g_fn_datum_next) {
         const uint8_t* players_arr = *g_players_array_ptr;
         if (players_arr) {
             const int32_t data_off = *reinterpret_cast<const int32_t*>(players_arr + kDataArrayOffsetToData);
             const uint8_t* data_base = players_arr + data_off;
-            const int32_t d0 = g_fn_datum_next(players_arr, -1);
-            const int32_t d1 = (d0 != -1) ? g_fn_datum_next(players_arr, d0) : -1;
-            if (d0 != -1 && d1 != -1) {
-                const uint32_t p0_unit = *reinterpret_cast<const uint32_t*>(data_base + static_cast<size_t>(d0 & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset);
-                const uint32_t p1_unit = *reinterpret_cast<const uint32_t*>(data_base + static_cast<size_t>(d1 & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset);
-                uint32_t p0_parent = 0xFFFFFFFFu;
-                int16_t p0_seat = -1;
-                uint32_t p1_parent = 0xFFFFFFFFu;
-                int16_t p1_seat = -1;
-                float p0_pos[3]{};
-                float p1_pos[3]{};
-                if (GetUnitSeatAndPos(p0_unit, p0_parent, p0_seat, p0_pos) &&
-                    GetUnitSeatAndPos(p1_unit, p1_parent, p1_seat, p1_pos)) {
-                    ++g_opening_diag_ticks;
-                    if (g_opening_diag_ticks <= 600 && (g_opening_diag_ticks % 60) == 1) {
-                        CE4P_LOG_INFO("[H1] OpeningCheck(%s t=%d): p0(0x%X par=0x%X seat=%d pos=%.1f,%.1f,%.1f) p1(0x%X par=0x%X seat=%d pos=%.1f,%.1f,%.1f)",
-                                      g_current_map_name[0] ? g_current_map_name : "?", g_opening_diag_ticks,
-                                      p0_unit, p0_parent, static_cast<int>(p0_seat), p0_pos[0], p0_pos[1], p0_pos[2],
-                                      p1_unit, p1_parent, static_cast<int>(p1_seat), p1_pos[0], p1_pos[1], p1_pos[2]);
+            uint32_t units[4]{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+            uint32_t parents[4]{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+            int16_t seats[4]{-1, -1, -1, -1};
+            float pos[4][3]{};
+            bool valid_unit[4]{};
+            int count = 0;
+            int32_t d = -1;
+            while (count < 4 && (d = g_fn_datum_next(players_arr, d)) != -1) {
+                units[count] = *reinterpret_cast<const uint32_t*>(
+                    data_base + static_cast<size_t>(d & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset
+                );
+                valid_unit[count] = GetUnitSeatAndPos(units[count], parents[count], seats[count], pos[count]);
+                ++count;
+            }
+
+            if (count >= 2) {
+                ++g_opening_diag_ticks;
+                int ref_idx = -1;
+                for (int i = 0; i < count; ++i) {
+                    if (valid_unit[i] && parents[i] == 0xFFFFFFFFu && seats[i] == -1) {
+                        ref_idx = i;
+                        break;
                     }
-                    if (g_opening_diag_ticks > 300 && p0_parent == 0xFFFFFFFFu && p0_seat == -1) {
-                        g_p0_ever_on_foot = true;
-                    } else if (p0_parent != 0xFFFFFFFFu && p0_seat != -1 && p1_parent == 0xFFFFFFFFu) {
-                        ++g_p1_on_foot_ticks;
-                        if (g_p1_on_foot_ticks >= 45) {
-                            g_fn_unit_exit_seat_force(p0_unit, false, false, true);
-                            float target_pos[3]{p1_pos[0], p1_pos[1] + 0.8f, p1_pos[2] + 0.05f};
+                }
+                for (int i = 0; i < count; ++i) {
+                    if (!valid_unit[i]) {
+                        continue;
+                    }
+                    if (g_opening_diag_ticks > 300 && parents[i] == 0xFFFFFFFFu && seats[i] == -1) {
+                        g_player_ever_on_foot[i] = true;
+                    } else if (!g_player_ever_on_foot[i] && !g_opening_eject_done[i] &&
+                               parents[i] != 0xFFFFFFFFu && seats[i] != -1 && ref_idx != -1) {
+                        ++g_player_stuck_ticks[i];
+                        if (g_player_stuck_ticks[i] >= 45) {
+                            g_fn_unit_exit_seat_force(units[i], false, false, true);
+                            const float side = (i % 2 == 0) ? 1.0f : -1.0f;
+                            const float mag = 0.8f + 0.4f * static_cast<float>(i / 2);
+                            float target_pos[3]{pos[ref_idx][0], pos[ref_idx][1] + side * mag, pos[ref_idx][2] + 0.05f};
                             if (g_fn_object_set_position) {
-                                g_fn_object_set_position(p0_unit, target_pos, nullptr, 0);
+                                g_fn_object_set_position(units[i], target_pos, nullptr, 0);
                             }
                             if (g_fn_post_teleport) {
-                                g_fn_post_teleport(p0_unit);
+                                g_fn_post_teleport(units[i]);
                             }
-                            g_opening_seat_eject_done = true;
-                            CE4P_LOG_INFO("[H1] OpeningSeatEject(%s): ForceExit + Move(p0=0x%X -> %.2f, %.2f, %.2f)",
+                            g_opening_eject_done[i] = true;
+                            CE4P_LOG_INFO("[H1] OpeningSeatEject(%s): ForceExit + Move(p%d=0x%X -> ref=p%d %.2f, %.2f, %.2f)",
                                           g_current_map_name[0] ? g_current_map_name : "?",
-                                          p0_unit, target_pos[0], target_pos[1], target_pos[2]);
+                                          i, units[i], ref_idx, target_pos[0], target_pos[1], target_pos[2]);
                         }
                     } else {
-                        g_p1_on_foot_ticks = 0;
+                        g_player_stuck_ticks[i] = 0;
                     }
                 }
             }
@@ -1855,9 +1865,9 @@ uint64_t __fastcall Hook_LoadLevelCoop(void* a1, void** a2, uint32_t a3, uint8_t
     LogStackTrace("LoadLevelCoop");
     ResetLockstepMultiplexState();
     std::snprintf(g_current_map_name, sizeof(g_current_map_name), "%s", map_str ? map_str : "?");
-    g_opening_seat_eject_done = false;
-    g_p0_ever_on_foot = false;
-    g_p1_on_foot_ticks = 0;
+    std::memset(g_opening_eject_done, 0, sizeof(g_opening_eject_done));
+    std::memset(g_player_ever_on_foot, 0, sizeof(g_player_ever_on_foot));
+    std::memset(g_player_stuck_ticks, 0, sizeof(g_player_stuck_ticks));
     g_opening_diag_ticks = 0;
 
     uint64_t ret = g_orig_load_level_coop(a1, a2, a3, a4_is_new, a5_is_online);
@@ -2501,6 +2511,7 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     g_hold_desired = 0;
     g_hold_until_ms = 0;
+    g_slot2_log_budget.store(8);
     g_matchmake_peer_cmp_addr = 0;
     g_transport_advert_cmp_addr = 0;
     if (g_hooked_has_channel_for_slot) {
@@ -2575,9 +2586,9 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_object_header_array_ptr = nullptr;
     g_object_pool_ptr = nullptr;
     g_current_map_name[0] = '\0';
-    g_opening_seat_eject_done = false;
-    g_p0_ever_on_foot = false;
-    g_p1_on_foot_ticks = 0;
+    std::memset(g_opening_eject_done, 0, sizeof(g_opening_eject_done));
+    std::memset(g_player_ever_on_foot, 0, sizeof(g_player_ever_on_foot));
+    std::memset(g_player_stuck_ticks, 0, sizeof(g_player_stuck_ticks));
     g_opening_diag_ticks = 0;
     if (g_hooked_has_player) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);

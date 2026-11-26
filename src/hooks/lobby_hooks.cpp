@@ -214,6 +214,11 @@ void __fastcall Hook_GHOnGameExit(void* self, uint32_t code, uint64_t a3) {
         code,
         static_cast<unsigned long long>(a3)
     );
+    {
+        std::lock_guard<std::mutex> lock(g_p2p_log_mutex);
+        g_seen_p2p_count = 0;
+    }
+    g_last_gh_progress_state = 0xFFFFFFFFu;
     g_orig_gh_exit(self, code, a3);
 }
 

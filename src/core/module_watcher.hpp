@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -32,11 +33,17 @@ public:
 
 private:
     void PollLoop();
+    void RegisterDllNotification();
+    void UnregisterDllNotification();
 
     std::string target_module_;
+    std::wstring target_module_wide_;
     ModuleCallback on_loaded_;
     ModuleCallback on_unloaded_;
     HANDLE thread_ = nullptr;
+    HANDLE wake_event_ = nullptr;
+    PVOID ldr_cookie_ = nullptr;
+    std::atomic<uint64_t> unload_seq_{0};
     volatile bool stop_requested_ = false;
 };
 
