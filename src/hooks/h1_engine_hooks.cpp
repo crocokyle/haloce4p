@@ -67,6 +67,11 @@ constexpr const char* kSigMatchMakeCampaignNet =
 constexpr const char* kSigMatchMakePeerCap =
     "83 BF 28 01 00 00 02 0F 8D";
 
+// halo1.dll: Transport channel cap @ 0x1802284BF (gates 0x180227ED0 PlayerUID/session tick)
+// 83 BA 28 01 00 00 [02] 7D 0F -> cmp dword ptr [rdx+0x128], 2; jge +0x0F
+constexpr const char* kSigTransportAdvertCap =
+    "83 BA 28 01 00 00 02 7D 0F";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -101,6 +106,7 @@ uintptr_t g_hooked_server_accept = 0;
 uintptr_t g_hooked_server_validate = 0;
 uintptr_t g_hooked_matchmake_campaign_net = 0;
 uintptr_t g_matchmake_peer_cmp_addr = 0;
+uintptr_t g_transport_advert_cmp_addr = 0;
 int g_launch_expected_players = 0;
 
 const uint32_t* g_net_active_ptr = nullptr;
@@ -281,6 +287,7 @@ uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void
         desired = static_cast<uint8_t>(g_launch_expected_players);
     }
     WritePeerCapByte(g_matchmake_peer_cmp_addr, desired);
+    WritePeerCapByte(g_transport_advert_cmp_addr, desired);
     CE4P_LOG_INFO(
         "[H1] MatchMake_campaign_net(is_host=%u, net_active=%u, launch_players=%d) -> wait_cap=%u",
         is_host,
@@ -292,6 +299,7 @@ uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void
     int32_t t_count = -1;
     int32_t t0_chans = -1;
     int32_t t0_peers = -1;
+    const uint8_t* sess = nullptr;
     if (g_h1_base) {
         const uint8_t* t_arr = *reinterpret_cast<const uint8_t* const*>(g_h1_base + 0x02E3CE50);
         if (t_arr) {
@@ -300,7 +308,7 @@ uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void
                 const uint8_t* const* vec = *reinterpret_cast<const uint8_t* const* const*>(t_arr + 0x10);
                 if (vec && vec[0]) {
                     t0_chans = *reinterpret_cast<const int32_t*>(vec[0] + 0x128);
-                    const uint8_t* sess = *reinterpret_cast<const uint8_t* const*>(vec[0] + 0x30);
+                    sess = *reinterpret_cast<const uint8_t* const*>(vec[0] + 0x30);
                     if (sess) {
                         t0_peers = *reinterpret_cast<const int32_t*>(sess + 0x50);
                     }
@@ -312,6 +320,31 @@ uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void
         "[H1] MatchMake_campaign_net returned (transports=%d, t0_chans=%d, t0_peers=%d)",
         t_count, t0_chans, t0_peers
     );
+    if (sess && t0_chans != static_cast<int32_t>(desired)) {
+        int32_t local_idx = *reinterpret_cast<const int32_t*>(sess + 0x30);
+        int32_t host_idx = *reinterpret_cast<const int32_t*>(sess + 0x34);
+        uint8_t f176 = *(sess + 0x176);
+        uint8_t f177 = *(sess + 0x177);
+        const int32_t* slots = reinterpret_cast<const int32_t*>(sess + 0x58);
+        CE4P_LOG_INFO(
+            "[H1] Session0: local=%d, host=%d, f176=%u, f177=%u, slots=[%d,%d,%d,%d]",
+            local_idx, host_idx, f176, f177, slots[0], slots[1], slots[2], slots[3]
+        );
+        const uint8_t* peers = *reinterpret_cast<const uint8_t* const*>(sess + 0x48);
+        if (peers && t0_peers > 0) {
+            int n = t0_peers < 8 ? t0_peers : 8;
+            for (int i = 0; i < n; ++i) {
+                const uint8_t* p = peers + static_cast<size_t>(i) * 0x118;
+                uint32_t pflags = *reinterpret_cast<const uint32_t*>(p);
+                int32_t pslot = *reinterpret_cast<const int32_t*>(p + 0x08);
+                uint64_t pmask = *reinterpret_cast<const uint64_t*>(p + 0x50);
+                CE4P_LOG_INFO(
+                    "[H1] Session0 peer[%d]: flags=0x%X, slot=%d, mask50=0x%llX",
+                    i, pflags, pslot, static_cast<unsigned long long>(pmask)
+                );
+            }
+        }
+    }
     return ret;
 }
 
@@ -701,6 +734,12 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
         }
     }
 
+    if (!g_transport_advert_cmp_addr) {
+        if (auto addr = ProbePattern(span, config, "TransportAdvertCap", kSigTransportAdvertCap)) {
+            g_transport_advert_cmp_addr = *addr;
+        }
+    }
+
     if (!g_hooked_matchmake_campaign_net) {
         if (auto addr = ProbePattern(span, config, "MatchMakeCampaignNet", kSigMatchMakeCampaignNet)) {
             if (uintptr_t net_ptr = ResolveRipRelative(*addr + 0x42, 2, 7)) {
@@ -743,6 +782,10 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     if (g_matchmake_peer_cmp_addr) {
         WritePeerCapByte(g_matchmake_peer_cmp_addr, 2);
         g_matchmake_peer_cmp_addr = 0;
+    }
+    if (g_transport_advert_cmp_addr) {
+        WritePeerCapByte(g_transport_advert_cmp_addr, 2);
+        g_transport_advert_cmp_addr = 0;
     }
     if (g_hooked_matchmake_campaign_net) {
         HookManager::Instance().RemoveHook(g_hooked_matchmake_campaign_net);
