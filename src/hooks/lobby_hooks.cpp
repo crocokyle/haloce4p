@@ -48,6 +48,9 @@ constexpr const char* kSigGHOnGameExit =
 // MCC-Win64-Shipping.exe: Halo1 IGameHost::UpdateProgress (+0xB8) @ 0x1401E8C6C
 constexpr const char* kSigGHUpdateProgress =
     "40 53 48 83 EC 30 48 8B 05 DF 89 E1 03 8B DA 0F 29 74 24 20 0F 28 F2 48";
+// MCC-Win64-Shipping.exe: Halo1 IGameHost::SendP2PUnreliable (+0x148) @ 0x1401EA298
+constexpr const char* kSigGHSendP2PUnreliable =
+    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 41 8B F9 49 8B F0 48 8B DA E8 8F 94 28 00";
 // MCC-Win64-Shipping.exe: Halo1 IGameHost::SendP2P (+0x150) @ 0x1401EA2E4
 constexpr const char* kSigGHSendP2P =
     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 41 8B F9 49 8B F0 48 8B DA E8 43 94 28 00";
@@ -95,6 +98,7 @@ FnGHUpdateProgress g_orig_gh_progress = nullptr;
 
 using FnGHSendP2P = int(__fastcall*)(void* self, uint64_t peer_or_type, const void* buf, uint32_t len, uint32_t port);
 FnGHSendP2P g_orig_gh_send_p2p = nullptr;
+FnGHSendP2P g_orig_gh_send_p2p_unrel = nullptr;
 
 using FnGHRecvP2P = int(__fastcall*)(void* self, void* buf, uint32_t len, uint64_t* out_peer_id, uint32_t port);
 FnGHRecvP2P g_orig_gh_recv_p2p = nullptr;
@@ -124,6 +128,22 @@ int __fastcall Hook_GHSendP2P(void* self, uint64_t peer_or_type, const void* buf
     if (RecordP2PKey(key)) {
         CE4P_LOG_INFO(
             "[IGameHost] SendP2P(arg2=0x%llX, len=%u, port=%u) -> ret=%d",
+            static_cast<unsigned long long>(peer_or_type),
+            len,
+            port,
+            ret
+        );
+    }
+    return ret;
+}
+
+int __fastcall Hook_GHSendP2PUnrel(void* self, uint64_t peer_or_type, const void* buf, uint32_t len, uint32_t port) {
+    int ret = g_orig_gh_send_p2p_unrel(self, peer_or_type, buf, len, port);
+    uint64_t key = (0x3ull << 62) ^ (peer_or_type * 0x9E3779B97F4A7C15ull) ^
+                   (static_cast<uint64_t>(port) << 16) ^ (ret >= 0 ? 1ull : 0ull);
+    if (RecordP2PKey(key)) {
+        CE4P_LOG_INFO(
+            "[IGameHost] SendP2PUnrel(arg2=0x%llX, len=%u, port=%u) -> ret=%d",
             static_cast<unsigned long long>(peer_or_type),
             len,
             port,
@@ -403,6 +423,17 @@ void Rescan(const ModConfig& config) {
                 *addr,
                 reinterpret_cast<void*>(&Hook_GHUpdateProgress),
                 reinterpret_cast<void**>(&g_orig_gh_progress)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GHSendP2PUnrel", kSigGHSendP2PUnreliable)) {
+        if (!g_orig_gh_send_p2p_unrel) {
+            HookManager::Instance().InstallHook(
+                "IGameHost::SendP2PUnrel",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GHSendP2PUnrel),
+                reinterpret_cast<void**>(&g_orig_gh_send_p2p_unrel)
             );
         }
     }
