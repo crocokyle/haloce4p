@@ -72,6 +72,11 @@ constexpr const char* kSigMatchMakePeerCap =
 constexpr const char* kSigTransportAdvertCap =
     "83 BA 28 01 00 00 02 7D 0F";
 
+// halo1.dll: HasChannelForSlot @ 0x1803F3290 (checks [transport+0x120] for slot key;
+// buggy: checks `slot` instead of `slot * 2`, causing slot 2 to collide with slot 1's key 2)
+constexpr const char* kSigHasChannelForSlot =
+    "40 57 44 8B 81 28 01 00 00 33 FF 44 8B DA 44 8B CF 45 85 C0 74 5E 48 89";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -105,6 +110,7 @@ uintptr_t g_hooked_client_handshake = 0;
 uintptr_t g_hooked_server_accept = 0;
 uintptr_t g_hooked_server_validate = 0;
 uintptr_t g_hooked_matchmake_campaign_net = 0;
+uintptr_t g_hooked_has_channel_for_slot = 0;
 uintptr_t g_matchmake_peer_cmp_addr = 0;
 uintptr_t g_transport_advert_cmp_addr = 0;
 int g_launch_expected_players = 0;
@@ -145,6 +151,9 @@ FnIGameEngineStart g_orig_engine_start = nullptr;
 
 using FnMatchMakeCampaignNet = uint64_t(__fastcall*)(void* a1, void* a2, void* a3, void* a4);
 FnMatchMakeCampaignNet g_orig_matchmake_campaign_net = nullptr;
+
+using FnHasChannelForSlot = bool(__fastcall*)(void* transport, int32_t slot);
+FnHasChannelForSlot g_orig_has_channel_for_slot = nullptr;
 
 using FnSessionReadyCheck = void(__fastcall*)();
 FnSessionReadyCheck g_orig_session_ready_check = nullptr;
@@ -277,6 +286,12 @@ void WritePeerCapByte(uintptr_t cmp_addr, uint8_t value) {
         VirtualProtect(target, 1, old_protect, &dummy);
         FlushInstructionCache(GetCurrentProcess(), target, 1);
     }
+}
+
+bool __fastcall Hook_HasChannelForSlot(void* transport, int32_t slot) {
+    // 0x1803F3750 inserts channels under key (slot * 2), whereas 0x1803F3290
+    // looks up `slot` directly; pass `slot * 2` so slot 2 doesn't collide with slot 1.
+    return g_orig_has_channel_for_slot(transport, slot * 2);
 }
 
 uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void* a4) {
@@ -740,6 +755,19 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
         }
     }
 
+    if (!g_hooked_has_channel_for_slot) {
+        if (auto addr = ProbePattern(span, config, "HasChannelForSlot", kSigHasChannelForSlot)) {
+            if (HookManager::Instance().InstallHook(
+                    "H1::HasChannelForSlot",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_HasChannelForSlot),
+                    reinterpret_cast<void**>(&g_orig_has_channel_for_slot)
+                )) {
+                g_hooked_has_channel_for_slot = *addr;
+            }
+        }
+    }
+
     if (!g_hooked_matchmake_campaign_net) {
         if (auto addr = ProbePattern(span, config, "MatchMakeCampaignNet", kSigMatchMakeCampaignNet)) {
             if (uintptr_t net_ptr = ResolveRipRelative(*addr + 0x42, 2, 7)) {
@@ -786,6 +814,11 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     if (g_transport_advert_cmp_addr) {
         WritePeerCapByte(g_transport_advert_cmp_addr, 2);
         g_transport_advert_cmp_addr = 0;
+    }
+    if (g_hooked_has_channel_for_slot) {
+        HookManager::Instance().RemoveHook(g_hooked_has_channel_for_slot);
+        g_hooked_has_channel_for_slot = 0;
+        g_orig_has_channel_for_slot = nullptr;
     }
     if (g_hooked_matchmake_campaign_net) {
         HookManager::Instance().RemoveHook(g_hooked_matchmake_campaign_net);
