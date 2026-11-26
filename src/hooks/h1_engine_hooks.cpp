@@ -276,6 +276,10 @@ void WritePeerCapByte(uintptr_t cmp_addr, uint8_t value) {
         return;
     }
     auto* target = reinterpret_cast<uint8_t*>(cmp_addr + 6);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(target, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+        return;
+    }
     if (*target == value) {
         return;
     }
@@ -483,6 +487,7 @@ int __fastcall Hook_CreateGameEngine(void** out_engine) {
 }
 
 uint64_t __fastcall Hook_InitGameSession(void* a1, void* a2, void* a3, uint32_t a4) {
+    CE4P_LOG_INFO("[H1] InitGameSession(a4=%u) enter", a4);
     if (g_h1_base && g_force_test_players > 1 && !g_hooked_has_player) {
         void* iface = *reinterpret_cast<void**>(g_h1_base + kRvaMccGameInterface);
         if (iface) {
@@ -807,14 +812,8 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    if (g_matchmake_peer_cmp_addr) {
-        WritePeerCapByte(g_matchmake_peer_cmp_addr, 2);
-        g_matchmake_peer_cmp_addr = 0;
-    }
-    if (g_transport_advert_cmp_addr) {
-        WritePeerCapByte(g_transport_advert_cmp_addr, 2);
-        g_transport_advert_cmp_addr = 0;
-    }
+    g_matchmake_peer_cmp_addr = 0;
+    g_transport_advert_cmp_addr = 0;
     if (g_hooked_has_channel_for_slot) {
         HookManager::Instance().RemoveHook(g_hooked_has_channel_for_slot);
         g_hooked_has_channel_for_slot = 0;
