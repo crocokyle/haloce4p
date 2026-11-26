@@ -282,9 +282,10 @@ using FnObjectSetPosition = void(__fastcall*)(uint32_t obj_datum, const float* x
 FnObjectSetPosition g_fn_object_set_position = nullptr;
 const uint8_t* const* g_object_header_array_ptr = nullptr;
 const uint8_t* const* g_object_pool_ptr = nullptr;
-bool g_is_map_a10 = false;
-bool g_a10_cryo_eject_done = false;
-int32_t g_a10_p1_on_foot_ticks = 0;
+char g_current_map_name[32]{};
+bool g_opening_seat_eject_done = false;
+bool g_p0_ever_on_foot = false;
+int32_t g_p1_on_foot_ticks = 0;
 
 bool GetUnitSeatAndPos(uint32_t unit_datum, uint32_t& out_parent, int16_t& out_seat, float out_pos[3]) {
     out_parent = 0xFFFFFFFFu;
@@ -1779,10 +1780,10 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
         }
     }
 
-    // Deterministic a10 cryochamber fix: on 3+ player co-op, if Player 0 remains seated
-    // in the cryotube while Player 1 is already on foot for 10s (300 ticks), force-eject
-    // Player 0 and move them to Player 1's position outside the glass identically on all peers.
-    if (g_is_map_a10 && !g_a10_cryo_eject_done && (*valid_mask_ptr & 0x1u) != 0 &&
+    // Deterministic opening-seat fix (a10 cryotube, a50 Pelican, etc.): if Player 0
+    // has never been on foot yet and remains seated while Player 1 is on foot for 1.5s (45 ticks),
+    // force-eject Player 0 and move them next to Player 1 identically on all peers.
+    if (!g_p0_ever_on_foot && !g_opening_seat_eject_done && (*valid_mask_ptr & 0x1u) != 0 &&
         g_fn_unit_exit_seat_force && g_players_array_ptr && g_fn_datum_next) {
         const uint8_t* players_arr = *g_players_array_ptr;
         if (players_arr) {
@@ -1800,9 +1801,11 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                 float p1_pos[3]{};
                 if (GetUnitSeatAndPos(p0_unit, p0_parent, p0_seat, nullptr) &&
                     GetUnitSeatAndPos(p1_unit, p1_parent, p1_seat, p1_pos)) {
-                    if (p0_parent != 0xFFFFFFFFu && p0_seat != -1 && p1_parent == 0xFFFFFFFFu) {
-                        ++g_a10_p1_on_foot_ticks;
-                        if (g_a10_p1_on_foot_ticks >= 90) {
+                    if (p0_parent == 0xFFFFFFFFu && p0_seat == -1) {
+                        g_p0_ever_on_foot = true;
+                    } else if (p0_parent != 0xFFFFFFFFu && p0_seat != -1 && p1_parent == 0xFFFFFFFFu) {
+                        ++g_p1_on_foot_ticks;
+                        if (g_p1_on_foot_ticks >= 45) {
                             g_fn_unit_exit_seat_force(p0_unit, false, false, true);
                             float target_pos[3]{p1_pos[0], p1_pos[1] + 0.8f, p1_pos[2] + 0.05f};
                             if (g_fn_object_set_position) {
@@ -1811,12 +1814,13 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                             if (g_fn_post_teleport) {
                                 g_fn_post_teleport(p0_unit);
                             }
-                            g_a10_cryo_eject_done = true;
-                            CE4P_LOG_INFO("[H1] a10 CryoEject: ForceExit + Move(p0=0x%X -> %.2f, %.2f, %.2f)",
+                            g_opening_seat_eject_done = true;
+                            CE4P_LOG_INFO("[H1] OpeningSeatEject(%s): ForceExit + Move(p0=0x%X -> %.2f, %.2f, %.2f)",
+                                          g_current_map_name[0] ? g_current_map_name : "?",
                                           p0_unit, target_pos[0], target_pos[1], target_pos[2]);
                         }
                     } else {
-                        g_a10_p1_on_foot_ticks = 0;
+                        g_p1_on_foot_ticks = 0;
                     }
                 }
             }
@@ -1841,9 +1845,10 @@ uint64_t __fastcall Hook_LoadLevelCoop(void* a1, void** a2, uint32_t a3, uint8_t
     );
     LogStackTrace("LoadLevelCoop");
     ResetLockstepMultiplexState();
-    g_is_map_a10 = (map_str && std::strcmp(map_str, "a10") == 0);
-    g_a10_cryo_eject_done = false;
-    g_a10_p1_on_foot_ticks = 0;
+    std::snprintf(g_current_map_name, sizeof(g_current_map_name), "%s", map_str ? map_str : "?");
+    g_opening_seat_eject_done = false;
+    g_p0_ever_on_foot = false;
+    g_p1_on_foot_ticks = 0;
 
     uint64_t ret = g_orig_load_level_coop(a1, a2, a3, a4_is_new, a5_is_online);
 
@@ -2559,9 +2564,10 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_fn_object_set_position = nullptr;
     g_object_header_array_ptr = nullptr;
     g_object_pool_ptr = nullptr;
-    g_is_map_a10 = false;
-    g_a10_cryo_eject_done = false;
-    g_a10_p1_on_foot_ticks = 0;
+    g_current_map_name[0] = '\0';
+    g_opening_seat_eject_done = false;
+    g_p0_ever_on_foot = false;
+    g_p1_on_foot_ticks = 0;
     if (g_hooked_has_player) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);
         g_hooked_has_player = 0;
