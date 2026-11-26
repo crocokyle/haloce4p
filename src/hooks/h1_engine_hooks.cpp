@@ -289,7 +289,29 @@ uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void
         static_cast<unsigned>(desired)
     );
     uint64_t ret = g_orig_matchmake_campaign_net(a1, a2, a3, a4);
-    CE4P_LOG_INFO("[H1] MatchMake_campaign_net returned");
+    int32_t t_count = -1;
+    int32_t t0_chans = -1;
+    int32_t t0_peers = -1;
+    if (g_h1_base) {
+        const uint8_t* t_arr = *reinterpret_cast<const uint8_t* const*>(g_h1_base + 0x02E3CE50);
+        if (t_arr) {
+            t_count = *reinterpret_cast<const int32_t*>(t_arr + 0x18);
+            if (t_count > 0) {
+                const uint8_t* const* vec = *reinterpret_cast<const uint8_t* const* const*>(t_arr + 0x10);
+                if (vec && vec[0]) {
+                    t0_chans = *reinterpret_cast<const int32_t*>(vec[0] + 0x128);
+                    const uint8_t* sess = *reinterpret_cast<const uint8_t* const*>(vec[0] + 0x30);
+                    if (sess) {
+                        t0_peers = *reinterpret_cast<const int32_t*>(sess + 0x50);
+                    }
+                }
+            }
+        }
+    }
+    CE4P_LOG_INFO(
+        "[H1] MatchMake_campaign_net returned (transports=%d, t0_chans=%d, t0_peers=%d)",
+        t_count, t0_chans, t0_peers
+    );
     return ret;
 }
 

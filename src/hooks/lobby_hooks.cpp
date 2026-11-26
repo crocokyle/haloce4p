@@ -48,6 +48,12 @@ constexpr const char* kSigGHOnGameExit =
 // MCC-Win64-Shipping.exe: Halo1 IGameHost::UpdateProgress (+0xB8) @ 0x1401E8C6C
 constexpr const char* kSigGHUpdateProgress =
     "40 53 48 83 EC 30 48 8B 05 DF 89 E1 03 8B DA 0F 29 74 24 20 0F 28 F2 48";
+// MCC-Win64-Shipping.exe: Halo1 IGameHost::SendP2P (+0x150) @ 0x1401EA2E4
+constexpr const char* kSigGHSendP2P =
+    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 41 8B F9 49 8B F0 48 8B DA E8 43 94 28 00";
+// MCC-Win64-Shipping.exe: Halo1 IGameHost::RecvP2P (+0x158) @ 0x1401EA334
+constexpr const char* kSigGHRecvP2P =
+    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 49 8B D9 41 8B F8 48 8B F2 E8 F3 93 28 00";
 
 constexpr size_t kVtableIdxGetMaxCampaignPlayers = 0x238 / 8;
 
@@ -87,7 +93,63 @@ FnGHOnGameExit g_orig_gh_exit = nullptr;
 using FnGHUpdateProgress = void(__fastcall*)(void* self, uint32_t state, float progress);
 FnGHUpdateProgress g_orig_gh_progress = nullptr;
 
+using FnGHSendP2P = int(__fastcall*)(void* self, uint64_t peer_or_type, const void* buf, uint32_t len, uint32_t port);
+FnGHSendP2P g_orig_gh_send_p2p = nullptr;
+
+using FnGHRecvP2P = int(__fastcall*)(void* self, void* buf, uint32_t len, uint64_t* out_peer_id, uint32_t port);
+FnGHRecvP2P g_orig_gh_recv_p2p = nullptr;
+
 uint32_t g_last_gh_progress_state = 0xFFFFFFFFu;
+std::mutex g_p2p_log_mutex;
+uint64_t g_seen_p2p_keys[64]{};
+size_t g_seen_p2p_count = 0;
+
+bool RecordP2PKey(uint64_t key) {
+    std::lock_guard<std::mutex> lock(g_p2p_log_mutex);
+    for (size_t i = 0; i < g_seen_p2p_count; ++i) {
+        if (g_seen_p2p_keys[i] == key) {
+            return false;
+        }
+    }
+    if (g_seen_p2p_count < 64) {
+        g_seen_p2p_keys[g_seen_p2p_count++] = key;
+    }
+    return true;
+}
+
+int __fastcall Hook_GHSendP2P(void* self, uint64_t peer_or_type, const void* buf, uint32_t len, uint32_t port) {
+    int ret = g_orig_gh_send_p2p(self, peer_or_type, buf, len, port);
+    uint64_t key = (0x1ull << 62) ^ (peer_or_type * 0x9E3779B97F4A7C15ull) ^
+                   (static_cast<uint64_t>(port) << 16) ^ (ret >= 0 ? 1ull : 0ull);
+    if (RecordP2PKey(key)) {
+        CE4P_LOG_INFO(
+            "[IGameHost] SendP2P(arg2=0x%llX, len=%u, port=%u) -> ret=%d",
+            static_cast<unsigned long long>(peer_or_type),
+            len,
+            port,
+            ret
+        );
+    }
+    return ret;
+}
+
+int __fastcall Hook_GHRecvP2P(void* self, void* buf, uint32_t len, uint64_t* out_peer_id, uint32_t port) {
+    int ret = g_orig_gh_recv_p2p(self, buf, len, out_peer_id, port);
+    if (ret > 0) {
+        uint64_t peer = out_peer_id ? *out_peer_id : 0;
+        uint64_t key = (0x2ull << 62) ^ (peer * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(port) << 16);
+        if (RecordP2PKey(key)) {
+            CE4P_LOG_INFO(
+                "[IGameHost] RecvP2P(port=%u, len=%u) -> ret=%d, peer_id=0x%llX",
+                port,
+                len,
+                ret,
+                static_cast<unsigned long long>(peer)
+            );
+        }
+    }
+    return ret;
+}
 
 void __fastcall Hook_GHNotify(void* self, uint32_t code, uint64_t a3, uint64_t a4) {
     CE4P_LOG_INFO(
@@ -341,6 +403,28 @@ void Rescan(const ModConfig& config) {
                 *addr,
                 reinterpret_cast<void*>(&Hook_GHUpdateProgress),
                 reinterpret_cast<void**>(&g_orig_gh_progress)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GHSendP2P", kSigGHSendP2P)) {
+        if (!g_orig_gh_send_p2p) {
+            HookManager::Instance().InstallHook(
+                "IGameHost::SendP2P",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GHSendP2P),
+                reinterpret_cast<void**>(&g_orig_gh_send_p2p)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GHRecvP2P", kSigGHRecvP2P)) {
+        if (!g_orig_gh_recv_p2p) {
+            HookManager::Instance().InstallHook(
+                "IGameHost::RecvP2P",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GHRecvP2P),
+                reinterpret_cast<void**>(&g_orig_gh_recv_p2p)
             );
         }
     }
