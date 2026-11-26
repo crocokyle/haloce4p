@@ -1804,15 +1804,16 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                         ++g_a10_p1_on_foot_ticks;
                         if (g_a10_p1_on_foot_ticks >= 90) {
                             g_fn_unit_exit_seat_force(p0_unit, false, false, true);
+                            float target_pos[3]{p1_pos[0], p1_pos[1] + 0.8f, p1_pos[2] + 0.05f};
                             if (g_fn_object_set_position) {
-                                g_fn_object_set_position(p0_unit, p1_pos, nullptr, 0);
+                                g_fn_object_set_position(p0_unit, target_pos, nullptr, 0);
                             }
                             if (g_fn_post_teleport) {
                                 g_fn_post_teleport(p0_unit);
                             }
                             g_a10_cryo_eject_done = true;
                             CE4P_LOG_INFO("[H1] a10 CryoEject: ForceExit + Move(p0=0x%X -> %.2f, %.2f, %.2f)",
-                                          p0_unit, p1_pos[0], p1_pos[1], p1_pos[2]);
+                                          p0_unit, target_pos[0], target_pos[1], target_pos[2]);
                         }
                     } else {
                         g_a10_p1_on_foot_ticks = 0;
