@@ -39,6 +39,15 @@ constexpr const char* kSigShowConnectionLostDialog =
 // MCC-Win64-Shipping.exe: OnGameEngineExit(rcx, dl) @ 0x14039CAD0
 constexpr const char* kSigOnGameEngineExit =
     "48 89 5C 24 08 57 48 83 EC 30 83 79 20 07 40 8A FA 48 8B D9 0F 84 BB 00";
+// MCC-Win64-Shipping.exe: Halo1 IGameHost::Notify (+0x18) @ 0x1401E65B4
+constexpr const char* kSigGHNotify =
+    "48 8B C4 57 48 83 EC 30 48 C7 40 E8 FE FF FF FF 48 89 58 08 48 89 68 18 48 89 70 20 8B F2 48 8D 2D 17 4A D9";
+// MCC-Win64-Shipping.exe: Halo1 IGameHost::OnGameExit (+0x20) @ 0x1401E6424
+constexpr const char* kSigGHOnGameExit =
+    "48 8B C4 55 56 57 48 8B EC 48 81 EC 80 00 00 00 48 C7 45 B0 FE FF FF FF 48 89 58 20 48 8B 05 11 69 A9 03 48";
+// MCC-Win64-Shipping.exe: Halo1 IGameHost::UpdateProgress (+0xB8) @ 0x1401E8C6C
+constexpr const char* kSigGHUpdateProgress =
+    "40 53 48 83 EC 30 48 8B 05 DF 89 E1 03 8B DA 0F 29 74 24 20 0F 28 F2 48";
 
 constexpr size_t kVtableIdxGetMaxCampaignPlayers = 0x238 / 8;
 
@@ -68,6 +77,44 @@ FnShowConnectionLostDialog g_orig_show_connection_lost = nullptr;
 
 using FnOnGameEngineExit = void(__fastcall*)(const uint8_t* session_ui, uint8_t flag);
 FnOnGameEngineExit g_orig_on_game_engine_exit = nullptr;
+
+using FnGHNotify = void(__fastcall*)(void* self, uint32_t code, uint64_t a3, uint64_t a4);
+FnGHNotify g_orig_gh_notify = nullptr;
+
+using FnGHOnGameExit = void(__fastcall*)(void* self, uint32_t code, uint64_t a3);
+FnGHOnGameExit g_orig_gh_exit = nullptr;
+
+using FnGHUpdateProgress = void(__fastcall*)(void* self, uint32_t state, float progress);
+FnGHUpdateProgress g_orig_gh_progress = nullptr;
+
+uint32_t g_last_gh_progress_state = 0xFFFFFFFFu;
+
+void __fastcall Hook_GHNotify(void* self, uint32_t code, uint64_t a3, uint64_t a4) {
+    CE4P_LOG_INFO(
+        "[IGameHost] Notify(code=%u, a3=0x%llX, a4=0x%llX)",
+        code,
+        static_cast<unsigned long long>(a3),
+        static_cast<unsigned long long>(a4)
+    );
+    g_orig_gh_notify(self, code, a3, a4);
+}
+
+void __fastcall Hook_GHOnGameExit(void* self, uint32_t code, uint64_t a3) {
+    CE4P_LOG_INFO(
+        "[IGameHost] OnGameExit(code=%u, a3=0x%llX)",
+        code,
+        static_cast<unsigned long long>(a3)
+    );
+    g_orig_gh_exit(self, code, a3);
+}
+
+void __fastcall Hook_GHUpdateProgress(void* self, uint32_t state, float progress) {
+    if (state != g_last_gh_progress_state) {
+        g_last_gh_progress_state = state;
+        CE4P_LOG_INFO("[IGameHost] UpdateProgress(state=%u, progress=%.2f)", state, progress);
+    }
+    g_orig_gh_progress(self, state, progress);
+}
 
 void __fastcall Hook_ShowConnectionLostDialog(const uint8_t* session_ui) {
     uint32_t state = session_ui ? *reinterpret_cast<const uint32_t*>(session_ui + 0x20) : 0;
@@ -261,6 +308,39 @@ void Rescan(const ModConfig& config) {
                 *addr,
                 reinterpret_cast<void*>(&Hook_OnGameEngineExit),
                 reinterpret_cast<void**>(&g_orig_on_game_engine_exit)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GHNotify", kSigGHNotify)) {
+        if (!g_orig_gh_notify) {
+            HookManager::Instance().InstallHook(
+                "IGameHost::Notify",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GHNotify),
+                reinterpret_cast<void**>(&g_orig_gh_notify)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GHOnGameExit", kSigGHOnGameExit)) {
+        if (!g_orig_gh_exit) {
+            HookManager::Instance().InstallHook(
+                "IGameHost::OnGameExit",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GHOnGameExit),
+                reinterpret_cast<void**>(&g_orig_gh_exit)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "GHUpdateProgress", kSigGHUpdateProgress)) {
+        if (!g_orig_gh_progress) {
+            HookManager::Instance().InstallHook(
+                "IGameHost::UpdateProgress",
+                *addr,
+                reinterpret_cast<void*>(&Hook_GHUpdateProgress),
+                reinterpret_cast<void**>(&g_orig_gh_progress)
             );
         }
     }
