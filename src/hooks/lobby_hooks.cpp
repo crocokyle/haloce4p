@@ -140,7 +140,8 @@ int __fastcall Hook_GHSendP2P(void* self, uint64_t peer_or_type, const void* buf
 int __fastcall Hook_GHSendP2PUnrel(void* self, uint64_t peer_or_type, const void* buf, uint32_t len, uint32_t port) {
     int ret = g_orig_gh_send_p2p_unrel(self, peer_or_type, buf, len, port);
     uint64_t key = (0x3ull << 62) ^ (peer_or_type * 0x9E3779B97F4A7C15ull) ^
-                   (static_cast<uint64_t>(port) << 16) ^ (ret >= 0 ? 1ull : 0ull);
+                   (static_cast<uint64_t>(port) << 16) ^ (ret >= 0 ? 1ull : 0ull) ^
+                   (port == 1002 ? (static_cast<uint64_t>(len) << 32) : 0ull);
     if (RecordP2PKey(key)) {
         CE4P_LOG_INFO(
             "[IGameHost] SendP2PUnrel(arg2=0x%llX, len=%u, port=%u) -> ret=%d",
@@ -149,6 +150,26 @@ int __fastcall Hook_GHSendP2PUnrel(void* self, uint64_t peer_or_type, const void
             port,
             ret
         );
+        if (port == 1002 && len >= 100 && buf) {
+            const auto* b = static_cast<const uint8_t*>(buf);
+            uint32_t n = len < 16 ? len : 16;
+            char hexbuf[64]{};
+            for (uint32_t i = 0; i < n; ++i) {
+                snprintf(hexbuf + i * 3, 4, "%02X ", b[i]);
+            }
+            HMODULE h1 = GetModuleHandleA("halo1.dll");
+            uintptr_t h1_base = reinterpret_cast<uintptr_t>(h1);
+            void* frames[10]{};
+            USHORT fc = CaptureStackBackTrace(1, 10, frames, nullptr);
+            CE4P_LOG_INFO("[IGameHost] SendP2PUnrel hdr=[%s] h1=0x%llX", hexbuf, static_cast<unsigned long long>(h1_base));
+            for (USHORT i = 0; i < fc; ++i) {
+                uintptr_t a = reinterpret_cast<uintptr_t>(frames[i]);
+                if (h1_base && a >= h1_base && a < h1_base + 0x4000000) {
+                    CE4P_LOG_INFO("[IGameHost]   stk[%u] -> halo1+0x%llX", static_cast<unsigned>(i),
+                                  static_cast<unsigned long long>(a - h1_base));
+                }
+            }
+        }
     }
     return ret;
 }
@@ -157,7 +178,9 @@ int __fastcall Hook_GHRecvP2P(void* self, void* buf, uint32_t len, uint64_t* out
     int ret = g_orig_gh_recv_p2p(self, buf, len, out_peer_id, port);
     if (ret > 0) {
         uint64_t peer = out_peer_id ? *out_peer_id : 0;
-        uint64_t key = (0x2ull << 62) ^ (peer * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(port) << 16);
+        uint64_t key = (0x2ull << 62) ^ (peer * 0x9E3779B97F4A7C15ull) ^
+                       (static_cast<uint64_t>(port) << 16) ^
+                       (port == 1002 ? (static_cast<uint64_t>(ret) << 32) : 0ull);
         if (RecordP2PKey(key)) {
             CE4P_LOG_INFO(
                 "[IGameHost] RecvP2P(port=%u, len=%u) -> ret=%d, peer_id=0x%llX",
