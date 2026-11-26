@@ -286,6 +286,7 @@ char g_current_map_name[32]{};
 bool g_opening_seat_eject_done = false;
 bool g_p0_ever_on_foot = false;
 int32_t g_p1_on_foot_ticks = 0;
+int32_t g_opening_diag_ticks = 0;
 
 bool GetUnitSeatAndPos(uint32_t unit_datum, uint32_t& out_parent, int16_t& out_seat, float out_pos[3]) {
     out_parent = 0xFFFFFFFFu;
@@ -1798,10 +1799,18 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                 int16_t p0_seat = -1;
                 uint32_t p1_parent = 0xFFFFFFFFu;
                 int16_t p1_seat = -1;
+                float p0_pos[3]{};
                 float p1_pos[3]{};
-                if (GetUnitSeatAndPos(p0_unit, p0_parent, p0_seat, nullptr) &&
+                if (GetUnitSeatAndPos(p0_unit, p0_parent, p0_seat, p0_pos) &&
                     GetUnitSeatAndPos(p1_unit, p1_parent, p1_seat, p1_pos)) {
-                    if (p0_parent == 0xFFFFFFFFu && p0_seat == -1) {
+                    ++g_opening_diag_ticks;
+                    if (g_opening_diag_ticks <= 600 && (g_opening_diag_ticks % 60) == 1) {
+                        CE4P_LOG_INFO("[H1] OpeningCheck(%s t=%d): p0(0x%X par=0x%X seat=%d pos=%.1f,%.1f,%.1f) p1(0x%X par=0x%X seat=%d pos=%.1f,%.1f,%.1f)",
+                                      g_current_map_name[0] ? g_current_map_name : "?", g_opening_diag_ticks,
+                                      p0_unit, p0_parent, static_cast<int>(p0_seat), p0_pos[0], p0_pos[1], p0_pos[2],
+                                      p1_unit, p1_parent, static_cast<int>(p1_seat), p1_pos[0], p1_pos[1], p1_pos[2]);
+                    }
+                    if (g_opening_diag_ticks > 300 && p0_parent == 0xFFFFFFFFu && p0_seat == -1) {
                         g_p0_ever_on_foot = true;
                     } else if (p0_parent != 0xFFFFFFFFu && p0_seat != -1 && p1_parent == 0xFFFFFFFFu) {
                         ++g_p1_on_foot_ticks;
@@ -1849,6 +1858,7 @@ uint64_t __fastcall Hook_LoadLevelCoop(void* a1, void** a2, uint32_t a3, uint8_t
     g_opening_seat_eject_done = false;
     g_p0_ever_on_foot = false;
     g_p1_on_foot_ticks = 0;
+    g_opening_diag_ticks = 0;
 
     uint64_t ret = g_orig_load_level_coop(a1, a2, a3, a4_is_new, a5_is_online);
 
@@ -2568,6 +2578,7 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_opening_seat_eject_done = false;
     g_p0_ever_on_foot = false;
     g_p1_on_foot_ticks = 0;
+    g_opening_diag_ticks = 0;
     if (g_hooked_has_player) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);
         g_hooked_has_player = 0;
