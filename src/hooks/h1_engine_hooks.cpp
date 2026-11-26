@@ -152,6 +152,10 @@ constexpr const char* kSigCoopIsSessionActive =
     "48 83 EC 28 48 83 3D CC 56 DE 02 00 75 6D 48 89 5C 24 20 48";
 constexpr const char* kSigTransportIsPeerConnected =
     "48 89 5C 24 18 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 81 EC 20 05 00";
+constexpr const char* kSigTransportFlushPeerPacket =
+    "48 8B C4 56 57 41 54 41 56 41 57 48 81 EC 50 05 00 00";
+constexpr const char* kSigTransportPrepareNextPacket =
+    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 20 8B 91 20 01 00 00 4C 8D 81 3C 01 00 00";
 
 constexpr const char* kSigEvalBytecode =
     "48 8B C4 4C 89 40 18 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 58 FC FF FF 48 81 EC 70 04 00 00";
@@ -174,6 +178,7 @@ constexpr uintptr_t kRvaLockstepFrameQueueCount = 0x01BA39E0;
 constexpr uintptr_t kRvaHostRemoteClientInputBuf = 0x01BA3A00;
 constexpr uintptr_t kRvaRemoteClientSlotId = 0x01BE96FC;
 constexpr uintptr_t kRvaActiveSession0Ptr = 0x02E3B478;
+constexpr uintptr_t kRvaMsgIdTablePtr = 0x02ED9988;
 constexpr uintptr_t kRvaMccGameInterface = 0x02E3B9A0;
 constexpr uintptr_t kRvaGameModeFlags = 0x02E3B821;
 constexpr uintptr_t kRvaDisconnectReason = 0x02EA3358;
@@ -293,6 +298,13 @@ FnCoopIsHostAndRemoteConnected g_orig_coop_is_host_and_remote = nullptr;
 
 using FnTransportIsPeerConnected = bool(__fastcall*)(const void* transport0, int32_t slot);
 FnTransportIsPeerConnected g_fn_transport_is_peer_connected = nullptr;
+
+using FnTransportFlushPeerPacket = void(__fastcall*)(void* transport0);
+FnTransportFlushPeerPacket g_fn_transport_flush_peer_packet = nullptr;
+
+using FnTransportPrepareNextPacket = int32_t(__fastcall*)(void* transport0);
+FnTransportPrepareNextPacket g_orig_transport_prepare_next_packet = nullptr;
+uintptr_t g_hooked_transport_prepare_next_packet = 0;
 
 using FnTransportSendPacket = char(__fastcall*)(void* transport0, uint32_t target_slot_mask, int32_t msg_id, void* pkt_buf, uint32_t pkt_bits, uint32_t flags, int32_t a7);
 FnTransportSendPacket g_orig_transport_send_packet = nullptr;
@@ -506,9 +518,19 @@ bool __fastcall Hook_HasChannelForSlot(void* transport, int32_t slot) {
             }
         }
     }
-    // 0x1803F3750 inserts channels under key (slot * 2), whereas 0x1803F3290
-    // looks up `slot` directly; pass `slot * 2` so slot 2 doesn't collide with slot 1.
-    return g_orig_has_channel_for_slot(transport, slot * 2);
+    const bool res = g_orig_has_channel_for_slot(transport, slot * 2);
+    if (slot >= 2) {
+        static std::atomic<int> slot2_log_budget{8};
+        if (slot2_log_budget.fetch_sub(1) > 0) {
+            const auto* s0 = reinterpret_cast<const uint8_t*>(transport);
+            const int32_t chans = s0 ? *reinterpret_cast<const int32_t*>(s0 + 0x128) : -1;
+            const uint8_t* t0 = s0 ? *reinterpret_cast<const uint8_t* const*>(s0 + 0x30) : nullptr;
+            const int32_t t0_peers = t0 ? *reinterpret_cast<const int32_t*>(t0 + 0x50) : -1;
+            CE4P_LOG_INFO("[H1] HasChannelForSlot(slot=%d, key=%d) -> %d (chans=%d, t0_peers=%d)",
+                          slot, slot * 2, res ? 1 : 0, chans, t0_peers);
+        }
+    }
+    return res;
 }
 
 uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void* a4) {
@@ -1266,16 +1288,12 @@ uint32_t GetConnectedRemoteClientsMask(const void* transport0, int32_t* out_firs
         if (slot_id <= 0 || slot_id >= 32) {
             continue;
         }
-        bool connected = false;
-        if (g_fn_transport_is_peer_connected) {
-            connected = g_fn_transport_is_peer_connected(transport0, slot_id);
-        } else {
-            const int32_t mapped = *reinterpret_cast<const int32_t*>(t + 0x58 + static_cast<size_t>(slot_id) * 4);
-            if (mapped >= 0 && mapped < peer_count) {
-                const uint32_t pflags = *reinterpret_cast<const uint32_t*>(peers + static_cast<size_t>(mapped) * 0x118);
-                connected = ((pflags >> 1) & 1u) != 0;
-            }
-        }
+        // Note: 0x1801D15B0 (g_fn_transport_is_peer_connected) is Transport0::PrepareSlotPacket,
+        // which mutates t0+0x138/t0+0x168 and checks send-window state. Use the read-only peer
+        // flags at t0->peers[mapped]+0x00 (bit 1 = slot assigned/connected) instead.
+        const int32_t mapped = *reinterpret_cast<const int32_t*>(t + 0x58 + static_cast<size_t>(slot_id) * 4);
+        const bool connected = (mapped >= 0 && mapped < peer_count) &&
+                               (((*reinterpret_cast<const uint32_t*>(peers + static_cast<size_t>(mapped) * 0x118)) >> 1) & 1u) != 0;
         if (connected) {
             mask |= (1u << static_cast<uint32_t>(slot_id));
             if (first_slot < 0) {
@@ -1317,6 +1335,42 @@ bool __fastcall Hook_CoopIsHostAndRemoteConnected() {
     return g_orig_coop_is_host_and_remote ? g_orig_coop_is_host_and_remote() : false;
 }
 
+// LTCG callers (e.g. 0x180AB150E) assume 0x180055E70 preserves volatile regs such as r9.
+void* BuildVolatilePreservingNoArgStub(void* target_fn) {
+    auto* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) {
+        return target_fn;
+    }
+    uint8_t* p = stub;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) {
+        for (uint8_t b : bytes) *p++ = b;
+    };
+    emit({0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});  // push rcx, rdx, r8..r11
+    emit({0x48, 0x83, 0xEC, 0x28});                                      // sub rsp, 0x28
+    emit({0x48, 0xB8});                                                  // mov rax, target_fn
+    uint64_t addr = reinterpret_cast<uint64_t>(target_fn);
+    std::memcpy(p, &addr, 8);
+    p += 8;
+    emit({0xFF, 0xD0});                                                  // call rax
+    emit({0x48, 0x83, 0xC4, 0x28});                                      // add rsp, 0x28
+    emit({0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59});  // pop r11..r8, rdx, rcx
+    emit({0xC3});                                                        // ret
+    FlushInstructionCache(GetCurrentProcess(), stub, 64);
+    return stub;
+}
+
+int32_t LookupMsgIdFromIndex(uintptr_t h1_base, uintptr_t idx_rva) {
+    const int32_t idx = *reinterpret_cast<const int32_t*>(h1_base + idx_rva);
+    if (idx < 0) {
+        return -1;
+    }
+    const auto* table = *reinterpret_cast<const uint8_t* const*>(h1_base + kRvaMsgIdTablePtr);
+    if (!table) {
+        return -1;
+    }
+    return *reinterpret_cast<const int32_t*>(table + static_cast<size_t>(idx) * 16 + 8);
+}
+
 char __fastcall Hook_TransportSendPacket(
     void* transport0,
     uint32_t target_slot_mask,
@@ -1328,21 +1382,162 @@ char __fastcall Hook_TransportSendPacket(
 ) {
     if (g_h1_base) {
         const int32_t local_player_idx = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaCoopLocalPlayerIndex);
-        const int32_t msg_lockstep = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaMsgIdLockstepFrame);
-        const int32_t msg_camera = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaMsgIdCameraSync);
-        const int32_t msg_input = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaMsgIdClientInput);
+        const int32_t msg_lockstep = LookupMsgIdFromIndex(g_h1_base, kRvaMsgIdLockstepFrame);
+        const int32_t msg_camera = LookupMsgIdFromIndex(g_h1_base, kRvaMsgIdCameraSync);
+        const int32_t msg_input = LookupMsgIdFromIndex(g_h1_base, kRvaMsgIdClientInput);
         if (local_player_idx == 0 && (msg_id == msg_lockstep || msg_id == msg_camera)) {
             if (const uint8_t* s0_t0 = GetTransportFromSession0()) {
                 const uint32_t remote_mask = GetConnectedRemoteClientsMask(s0_t0);
+                static std::atomic<int> send_diag_budget{10};
+                if (send_diag_budget.fetch_sub(1) > 0) {
+                    const int32_t pcnt = *reinterpret_cast<const int32_t*>(s0_t0 + 0x50);
+                    const uint8_t* peers = *reinterpret_cast<const uint8_t* const*>(s0_t0 + 0x48);
+                    const uint8_t* ll = *reinterpret_cast<const uint8_t* const*>(s0_t0 + 0x118);
+                    const uint8_t* ll_chans = ll ? *reinterpret_cast<const uint8_t* const*>(ll + 0x20) : nullptr;
+                    for (int pi = 0; pi < pcnt && pi < 4 && peers; ++pi) {
+                        const uint8_t* p = peers + static_cast<size_t>(pi) * 0x118;
+                        const uint32_t pf = *reinterpret_cast<const uint32_t*>(p);
+                        const int32_t ps = *reinterpret_cast<const int32_t*>(p + 0x08);
+                        const int32_t ch = *reinterpret_cast<const int32_t*>(p + 0x4C);
+                        uint32_t lf = 0;
+                        int32_t ls = -1;
+                        if (ll_chans && ch >= 0) {
+                            lf = *reinterpret_cast<const uint32_t*>(ll_chans + static_cast<size_t>(ch) * 0x38);
+                            ls = *reinterpret_cast<const int32_t*>(ll_chans + static_cast<size_t>(ch) * 0x38 + 0x04);
+                        }
+                        CE4P_LOG_INFO("[H1] SendPkt(msg=%d, orig_mask=0x%X, new_mask=0x%X) peer[%d]: slot=%d flags=0x%X ch=%d ll_flags=0x%X ll_state=%d",
+                                      msg_id, target_slot_mask, remote_mask, pi, ps, pf, ch, lf, ls);
+                    }
+                }
                 if (remote_mask != 0) {
                     target_slot_mask = remote_mask;
                 }
             }
         } else if (local_player_idx > 0 && (msg_id == msg_input || msg_id == msg_camera)) {
             target_slot_mask = 1u;
+        } else if (transport0 == GetTransportFromSession0() && msg_id != msg_lockstep && msg_id != msg_camera && msg_id != msg_input) {
+            static std::atomic<int> nonlock_diag_budget{30};
+            if (nonlock_diag_budget.fetch_sub(1) > 0) {
+                CE4P_LOG_INFO("[H1] SendPktOther(msg=%d, mask=0x%X, bits=%u, local_pidx=%d)",
+                              msg_id, target_slot_mask, pkt_bits, local_player_idx);
+            }
         }
     }
-    return g_orig_transport_send_packet(transport0, target_slot_mask, msg_id, pkt_buf, pkt_bits, flags, a7);
+
+    bool multi_peer_queue_flush = false;
+    if (g_h1_base && transport0 && g_fn_transport_is_peer_connected && g_fn_transport_flush_peer_packet) {
+        const int32_t local_player_idx = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaCoopLocalPlayerIndex);
+        const int32_t msg_lockstep = LookupMsgIdFromIndex(g_h1_base, kRvaMsgIdLockstepFrame);
+        const int32_t msg_camera = LookupMsgIdFromIndex(g_h1_base, kRvaMsgIdCameraSync);
+        if (local_player_idx == 0 && (msg_id == msg_lockstep || msg_id == msg_camera) &&
+            transport0 == GetTransportFromSession0() &&
+            target_slot_mask != 0 && (target_slot_mask & (target_slot_mask - 1u)) != 0) {
+            multi_peer_queue_flush = true;
+            auto* t0_bytes = reinterpret_cast<uint8_t*>(transport0);
+            // Flush any active single-peer buffer first so t0+0x138 becomes -1.
+            // This forces TransportSendPacket onto the QueueMessage (0x1801D03A0) path
+            // instead of writing directly into one peer's t0+0x140 buffer.
+            if (*reinterpret_cast<const int32_t*>(t0_bytes + 0x138) >= 0) {
+                g_fn_transport_flush_peer_packet(transport0);
+            }
+        }
+    }
+
+    const char ret = g_orig_transport_send_packet(transport0, target_slot_mask, msg_id, pkt_buf, pkt_bits, flags, a7);
+    if (multi_peer_queue_flush) {
+        auto* t0_bytes = reinterpret_cast<uint8_t*>(transport0);
+        const int32_t first_slot = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaRemoteClientSlotId);
+        static std::atomic<int> extra_diag_budget{10};
+        const bool do_diag = (extra_diag_budget.fetch_sub(1) > 0);
+        for (int32_t s = 1; s < 32; ++s) {
+            if ((target_slot_mask & (1u << static_cast<uint32_t>(s))) != 0) {
+                const bool prep_ok = g_fn_transport_is_peer_connected(transport0, s);
+                const int32_t s_peer = *reinterpret_cast<const int32_t*>(t0_bytes + 0x138);
+                const int32_t s_bits = *reinterpret_cast<const int32_t*>(t0_bytes + 0x154);
+                const int32_t s_msgs = *reinterpret_cast<const int32_t*>(t0_bytes + 0x168);
+                if (do_diag) {
+                    CE4P_LOG_INFO("[H1] MultiFlush(msg=%d, mask=0x%X) -> slot=%d prep_ok=%d peer=%d bits=%d msgs=%d",
+                                  msg_id, target_slot_mask, s, prep_ok ? 1 : 0, s_peer, s_bits, s_msgs);
+                }
+                if (prep_ok) {
+                    g_fn_transport_flush_peer_packet(transport0);
+                }
+            }
+        }
+        // Restore t0+0x138 >= 0 so caller's subsequent FlushPeerPacket(t0) never sees -1.
+        if (first_slot >= 1 && first_slot < 32) {
+            g_fn_transport_is_peer_connected(transport0, first_slot);
+            if (*reinterpret_cast<const int32_t*>(t0_bytes + 0x138) < 0) {
+                *reinterpret_cast<int32_t*>(t0_bytes + 0x138) =
+                    *reinterpret_cast<const int32_t*>(t0_bytes + 0x58 + static_cast<size_t>(first_slot) * 4);
+            }
+        }
+    } else if (g_h1_base && transport0 && g_fn_transport_is_peer_connected && g_fn_transport_flush_peer_packet) {
+        const int32_t local_player_idx = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaCoopLocalPlayerIndex);
+        if (local_player_idx == 0 && transport0 == GetTransportFromSession0() && target_slot_mask == 0xFFFFFFFFu) {
+            const uint32_t remote_mask = GetConnectedRemoteClientsMask(transport0);
+            if ((remote_mask & ~2u) != 0) {
+                auto* t0_bytes = reinterpret_cast<uint8_t*>(transport0);
+                if (*reinterpret_cast<const int32_t*>(t0_bytes + 0x138) >= 0) {
+                    g_fn_transport_flush_peer_packet(transport0);
+                }
+                for (int32_t s = 1; s < 32; ++s) {
+                    if ((remote_mask & (1u << static_cast<uint32_t>(s))) != 0) {
+                        if (g_fn_transport_is_peer_connected(transport0, s)) {
+                            g_fn_transport_flush_peer_packet(transport0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+int32_t __fastcall Hook_TransportPrepareNextPacket(void* transport0) {
+    const int32_t peer_idx = g_orig_transport_prepare_next_packet(transport0);
+    if (peer_idx < 0 || !g_h1_base || !transport0 || transport0 != GetTransportFromSession0() ||
+        !g_fn_transport_is_peer_connected || !g_fn_transport_flush_peer_packet) {
+        return peer_idx;
+    }
+
+    const auto* t0_bytes = reinterpret_cast<const uint8_t*>(transport0);
+    const int32_t local_peer_idx = *reinterpret_cast<const int32_t*>(t0_bytes + 0x30);
+    const int32_t peer_count = *reinterpret_cast<const int32_t*>(t0_bytes + 0x50);
+    const auto* peers = *reinterpret_cast<const uint8_t* const*>(t0_bytes + 0x48);
+    if (!peers || local_peer_idx < 0 || local_peer_idx >= peer_count || peer_idx >= peer_count) {
+        return peer_idx;
+    }
+
+    const int32_t local_slot = *reinterpret_cast<const int32_t*>(peers + static_cast<size_t>(local_peer_idx) * 0x118 + 0x08);
+    if (local_slot != 0) {
+        return peer_idx;
+    }
+
+    const int32_t prepared_slot = *reinterpret_cast<const int32_t*>(peers + static_cast<size_t>(peer_idx) * 0x118 + 0x08);
+    const uint32_t remote_mask = GetConnectedRemoteClientsMask(transport0);
+    const uint32_t prepared_bit = (prepared_slot >= 1 && prepared_slot < 32) ? (1u << static_cast<uint32_t>(prepared_slot)) : 0u;
+    if ((remote_mask & ~prepared_bit) == 0) {
+        return peer_idx;
+    }
+
+    // Flush the peer PrepareNextPacket just packed first, then prepare+flush all other connected remote peers
+    // so Session0::Tick does not starve slot >= 2 on a 100ms per-peer cadence.
+    g_fn_transport_flush_peer_packet(transport0);
+    for (int32_t s = 1; s < 32; ++s) {
+        if (s != prepared_slot && (remote_mask & (1u << static_cast<uint32_t>(s))) != 0) {
+            if (g_fn_transport_is_peer_connected(transport0, s)) {
+                g_fn_transport_flush_peer_packet(transport0);
+            }
+        }
+    }
+
+    static std::atomic<int> prep_diag_budget{15};
+    if (prep_diag_budget.fetch_sub(1) > 0) {
+        CE4P_LOG_INFO("[H1] PrepareNextPacket flushed peer_idx=%d (slot=%d) + remote_mask=0x%X",
+                      peer_idx, prepared_slot, remote_mask);
+    }
+    return -1;
 }
 
 void __fastcall Hook_SerializeClientInputVTable(void* factory, uint8_t** pkt_58_ptr, void* bitstream) {
@@ -1741,6 +1936,23 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             g_fn_transport_is_peer_connected = reinterpret_cast<FnTransportIsPeerConnected>(*addr);
         }
     }
+    if (!g_fn_transport_flush_peer_packet) {
+        if (auto addr = ProbePattern(span, config, "TransportFlushPeerPacket", kSigTransportFlushPeerPacket)) {
+            g_fn_transport_flush_peer_packet = reinterpret_cast<FnTransportFlushPeerPacket>(*addr);
+        }
+    }
+    if (!g_hooked_transport_prepare_next_packet) {
+        if (auto addr = ProbePattern(span, config, "TransportPrepareNextPacket", kSigTransportPrepareNextPacket)) {
+            if (HookManager::Instance().InstallHook(
+                    "H1::TransportPrepareNextPacket",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_TransportPrepareNextPacket),
+                    reinterpret_cast<void**>(&g_orig_transport_prepare_next_packet)
+                )) {
+                g_hooked_transport_prepare_next_packet = *addr;
+            }
+        }
+    }
 
     if (!g_hooked_ext_get_local_players_count) {
         if (auto addr = ProbePattern(span, config, "ExtGetLocalPlayersCount", kSigExtGetLocalPlayersCount)) {
@@ -1757,10 +1969,11 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
 
     if (!g_hooked_coop_is_host_and_remote) {
         if (auto addr = ProbePattern(span, config, "CoopIsHostAndRemoteConn", kSigCoopIsHostAndRemoteConn)) {
+            void* stub = BuildVolatilePreservingNoArgStub(reinterpret_cast<void*>(&Hook_CoopIsHostAndRemoteConnected));
             if (HookManager::Instance().InstallHook(
                     "H1::CoopIsHostAndRemoteConnected",
                     *addr,
-                    reinterpret_cast<void*>(&Hook_CoopIsHostAndRemoteConnected),
+                    stub,
                     reinterpret_cast<void**>(&g_orig_coop_is_host_and_remote)
                 )) {
                 g_hooked_coop_is_host_and_remote = *addr;
@@ -2267,6 +2480,7 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     unhook(g_hooked_deserialize_client_input, g_orig_deserialize_client_input);
     unhook(g_hooked_serialize_client_input_vtbl, g_orig_serialize_client_input_vtbl);
     unhook(g_hooked_transport_send_packet, g_orig_transport_send_packet);
+    unhook(g_hooked_transport_prepare_next_packet, g_orig_transport_prepare_next_packet);
     unhook(g_hooked_coop_is_host_and_remote, g_orig_coop_is_host_and_remote);
     unhook(g_hooked_ext_get_local_players_count, g_orig_ext_get_local_players_count);
     unhook(g_hooked_session_players_count, g_orig_session_players_count);
@@ -2280,6 +2494,7 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_fn_deserialize_action = nullptr;
     g_fn_coop_is_session_active = nullptr;
     g_fn_transport_is_peer_connected = nullptr;
+    g_fn_transport_flush_peer_packet = nullptr;
     ResetLockstepMultiplexState();
 
     g_h1_patches.RevertAll();
