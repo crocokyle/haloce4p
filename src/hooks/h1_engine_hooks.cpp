@@ -162,6 +162,8 @@ constexpr const char* kSigEvalBytecode =
 
 constexpr const char* kSigMscriptLogSink =
     "4C 8B DC 49 89 6B 20 57 48 81 EC C0 00 00 00 48 8B 01 33 ED 48 89 2A";
+constexpr const char* kSigUnitExitVehicle =
+    "48 83 EC 28 41 83 CB FF 41 3B CB 74 60 0F B7 D1 41 BA D8 00 00 00";
 
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
@@ -271,6 +273,44 @@ FnPostTeleportReset g_fn_post_teleport = nullptr;
 
 using FnDatumArrayNext = int32_t(__fastcall*)(const void* data_array, int32_t prev_datum);
 FnDatumArrayNext g_fn_datum_next = nullptr;
+
+using FnUnitExitVehicle = void(__fastcall*)(uint32_t unit_datum);
+FnUnitExitVehicle g_fn_unit_exit_vehicle = nullptr;
+using FnUnitExitSeatForce = void(__fastcall*)(uint32_t unit_datum, bool a2, bool a3, bool force);
+FnUnitExitSeatForce g_fn_unit_exit_seat_force = nullptr;
+using FnObjectSetPosition = void(__fastcall*)(uint32_t obj_datum, const float* xyz, const float* forward, uint8_t a4);
+FnObjectSetPosition g_fn_object_set_position = nullptr;
+const uint8_t* const* g_object_header_array_ptr = nullptr;
+const uint8_t* const* g_object_pool_ptr = nullptr;
+bool g_is_map_a10 = false;
+bool g_a10_cryo_eject_done = false;
+int32_t g_a10_p1_on_foot_ticks = 0;
+
+bool GetUnitSeatAndPos(uint32_t unit_datum, uint32_t& out_parent, int16_t& out_seat, float out_pos[3]) {
+    out_parent = 0xFFFFFFFFu;
+    out_seat = -1;
+    if (unit_datum == 0xFFFFFFFFu || !g_object_header_array_ptr || !g_object_pool_ptr) {
+        return false;
+    }
+    const uint8_t* hdr_arr = *g_object_header_array_ptr;
+    const uint8_t* pool = *g_object_pool_ptr;
+    if (!hdr_arr || !pool) {
+        return false;
+    }
+    const int32_t data_off = *reinterpret_cast<const int32_t*>(hdr_arr + kDataArrayOffsetToData);
+    const uint32_t idx = unit_datum & 0xFFFFu;
+    const int32_t pool_off = *reinterpret_cast<const int32_t*>(hdr_arr + data_off + static_cast<size_t>(idx) * 12 + 0x08);
+    if (pool_off < 0) {
+        return false;
+    }
+    const uint8_t* obj = pool + static_cast<size_t>(pool_off);
+    out_parent = *reinterpret_cast<const uint32_t*>(obj + 0x10C);
+    out_seat = *reinterpret_cast<const int16_t*>(obj + 0x304);
+    if (out_pos) {
+        std::memcpy(out_pos, obj + 0x4C, sizeof(float) * 3);
+    }
+    return true;
+}
 
 using FnIGameEngineStart = void(__fastcall*)(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4);
 FnIGameEngineStart g_orig_engine_start = nullptr;
@@ -1738,6 +1778,49 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
             }
         }
     }
+
+    // Deterministic a10 cryochamber fix: on 3+ player co-op, if Player 0 remains seated
+    // in the cryotube while Player 1 is already on foot for 10s (300 ticks), force-eject
+    // Player 0 and move them to Player 1's position outside the glass identically on all peers.
+    if (g_is_map_a10 && !g_a10_cryo_eject_done && (*valid_mask_ptr & 0x1u) != 0 &&
+        g_fn_unit_exit_seat_force && g_players_array_ptr && g_fn_datum_next) {
+        const uint8_t* players_arr = *g_players_array_ptr;
+        if (players_arr) {
+            const int32_t data_off = *reinterpret_cast<const int32_t*>(players_arr + kDataArrayOffsetToData);
+            const uint8_t* data_base = players_arr + data_off;
+            const int32_t d0 = g_fn_datum_next(players_arr, -1);
+            const int32_t d1 = (d0 != -1) ? g_fn_datum_next(players_arr, d0) : -1;
+            if (d0 != -1 && d1 != -1) {
+                const uint32_t p0_unit = *reinterpret_cast<const uint32_t*>(data_base + static_cast<size_t>(d0 & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset);
+                const uint32_t p1_unit = *reinterpret_cast<const uint32_t*>(data_base + static_cast<size_t>(d1 & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset);
+                uint32_t p0_parent = 0xFFFFFFFFu;
+                int16_t p0_seat = -1;
+                uint32_t p1_parent = 0xFFFFFFFFu;
+                int16_t p1_seat = -1;
+                float p1_pos[3]{};
+                if (GetUnitSeatAndPos(p0_unit, p0_parent, p0_seat, nullptr) &&
+                    GetUnitSeatAndPos(p1_unit, p1_parent, p1_seat, p1_pos)) {
+                    if (p0_parent != 0xFFFFFFFFu && p0_seat != -1 && p1_parent == 0xFFFFFFFFu) {
+                        ++g_a10_p1_on_foot_ticks;
+                        if (g_a10_p1_on_foot_ticks >= 90) {
+                            g_fn_unit_exit_seat_force(p0_unit, false, false, true);
+                            if (g_fn_object_set_position) {
+                                g_fn_object_set_position(p0_unit, p1_pos, nullptr, 0);
+                            }
+                            if (g_fn_post_teleport) {
+                                g_fn_post_teleport(p0_unit);
+                            }
+                            g_a10_cryo_eject_done = true;
+                            CE4P_LOG_INFO("[H1] a10 CryoEject: ForceExit + Move(p0=0x%X -> %.2f, %.2f, %.2f)",
+                                          p0_unit, p1_pos[0], p1_pos[1], p1_pos[2]);
+                        }
+                    } else {
+                        g_a10_p1_on_foot_ticks = 0;
+                    }
+                }
+            }
+        }
+    }
 }
 
 uint64_t __fastcall Hook_LoadLevelSolo(void* a1, void** a2, uint32_t a3, uint8_t a4_is_new) {
@@ -1757,6 +1840,9 @@ uint64_t __fastcall Hook_LoadLevelCoop(void* a1, void** a2, uint32_t a3, uint8_t
     );
     LogStackTrace("LoadLevelCoop");
     ResetLockstepMultiplexState();
+    g_is_map_a10 = (map_str && std::strcmp(map_str, "a10") == 0);
+    g_a10_cryo_eject_done = false;
+    g_a10_p1_on_foot_ticks = 0;
 
     uint64_t ret = g_orig_load_level_coop(a1, a2, a3, a4_is_new, a5_is_online);
 
@@ -2116,6 +2202,17 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     ProbePattern(span, config, "GameCreatePlayer", kSigGameCreatePlayer);
     ProbePattern(span, config, "CoopRespawnCheck", kSigCoopRespawnCheck);
 
+    if (!g_fn_unit_exit_vehicle) {
+        if (auto addr = ProbePattern(span, config, "UnitExitVehicle", kSigUnitExitVehicle)) {
+            g_fn_unit_exit_vehicle = reinterpret_cast<FnUnitExitVehicle>(*addr);
+            if (uintptr_t hdr_ptr = ResolveRipRelative(*addr + 0x1A, 3, 7)) {
+                g_object_header_array_ptr = reinterpret_cast<const uint8_t* const*>(hdr_ptr);
+            }
+            if (uintptr_t pool_ptr = ResolveRipRelative(*addr + 0x2D, 3, 7)) {
+                g_object_pool_ptr = reinterpret_cast<const uint8_t* const*>(pool_ptr);
+            }
+        }
+    }
     if (!g_hooked_object_teleport) {
         if (auto vol_tp = ProbePattern(span, config, "VolumeTeleport", kSigVolumeTeleport)) {
             if (uintptr_t players_ptr = ResolveRipRelative(*vol_tp + 0x19, 3, 7)) {
@@ -2128,6 +2225,12 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
                 g_fn_datum_next = reinterpret_cast<FnDatumArrayNext>(datum_next);
             }
             if (uintptr_t obj_tp = ResolveRipRelative(*vol_tp + 0x60, 1, 5)) {
+                if (uintptr_t force_exit = ResolveRipRelative(obj_tp + 0xD9, 1, 5)) {
+                    g_fn_unit_exit_seat_force = reinterpret_cast<FnUnitExitSeatForce>(force_exit);
+                }
+                if (uintptr_t set_pos = ResolveRipRelative(obj_tp + 0x263, 1, 5)) {
+                    g_fn_object_set_position = reinterpret_cast<FnObjectSetPosition>(set_pos);
+                }
                 if (HookManager::Instance().InstallHook(
                         "H1::ObjectTeleportToFlag",
                         obj_tp,
@@ -2450,6 +2553,14 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_players_array_ptr = nullptr;
     g_fn_post_teleport = nullptr;
     g_fn_datum_next = nullptr;
+    g_fn_unit_exit_vehicle = nullptr;
+    g_fn_unit_exit_seat_force = nullptr;
+    g_fn_object_set_position = nullptr;
+    g_object_header_array_ptr = nullptr;
+    g_object_pool_ptr = nullptr;
+    g_is_map_a10 = false;
+    g_a10_cryo_eject_done = false;
+    g_a10_p1_on_foot_ticks = 0;
     if (g_hooked_has_player) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);
         g_hooked_has_player = 0;
