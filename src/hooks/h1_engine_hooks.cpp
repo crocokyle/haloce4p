@@ -204,6 +204,8 @@ uintptr_t g_hooked_server_validate = 0;
 uintptr_t g_hooked_matchmake_campaign_net = 0;
 std::atomic<bool> g_init_session_entered{false};
 uintptr_t g_hooked_has_channel_for_slot = 0;
+uint8_t g_hold_desired = 0;
+uint64_t g_hold_until_ms = 0;
 uintptr_t g_matchmake_peer_cmp_addr = 0;
 uintptr_t g_transport_advert_cmp_addr = 0;
 int g_launch_expected_players = 0;
@@ -489,6 +491,21 @@ void WritePeerCapByte(uintptr_t cmp_addr, uint8_t value) {
 }
 
 bool __fastcall Hook_HasChannelForSlot(void* transport, int32_t slot) {
+    if (g_hold_desired > 2 && transport) {
+        const auto* s0 = reinterpret_cast<const uint8_t*>(transport);
+        const int32_t chans = *reinterpret_cast<const int32_t*>(s0 + 0x128);
+        const uint8_t* t0 = *reinterpret_cast<const uint8_t* const*>(s0 + 0x30);
+        const int32_t t0_peers = t0 ? *reinterpret_cast<const int32_t*>(t0 + 0x50) : 0;
+        if (chans >= static_cast<int32_t>(g_hold_desired) && t0_peers >= static_cast<int32_t>(g_hold_desired)) {
+            const uint64_t now = GetTickCount64();
+            if (g_hold_until_ms == 0) {
+                g_hold_until_ms = now + 2500;
+            } else if (now >= g_hold_until_ms) {
+                WritePeerCapByte(g_matchmake_peer_cmp_addr, g_hold_desired);
+                g_hold_desired = 0;
+            }
+        }
+    }
     // 0x1803F3750 inserts channels under key (slot * 2), whereas 0x1803F3290
     // looks up `slot` directly; pass `slot * 2` so slot 2 doesn't collide with slot 1.
     return g_orig_has_channel_for_slot(transport, slot * 2);
@@ -501,7 +518,9 @@ uint64_t __fastcall Hook_MatchMakeCampaignNet(void* a1, void* a2, void* a3, void
     if (net_active != 0 && g_launch_expected_players >= 2 && g_launch_expected_players <= 4) {
         desired = static_cast<uint8_t>(g_launch_expected_players);
     }
-    WritePeerCapByte(g_matchmake_peer_cmp_addr, desired);
+    g_hold_until_ms = 0;
+    g_hold_desired = (is_host != 0 && net_active != 0 && desired > 2) ? desired : 0;
+    WritePeerCapByte(g_matchmake_peer_cmp_addr, g_hold_desired ? static_cast<uint8_t>(desired + 1) : desired);
     WritePeerCapByte(g_transport_advert_cmp_addr, desired);
     CE4P_LOG_INFO(
         "[H1] MatchMake_campaign_net(is_host=%u, net_active=%u, launch_players=%d) -> wait_cap=%u",
@@ -1397,8 +1416,8 @@ void __fastcall Hook_CoopLockstepOnPacket(uint8_t* mgr, uint64_t a2, int32_t msg
     void* msg_obj = *reinterpret_cast<void* const*>(reinterpret_cast<const uint8_t*>(msg_envelope) + 0x08);
     if (msg_obj) {
         auto* vtbl = *reinterpret_cast<uintptr_t* const*>(msg_obj);
-        auto fn_get = reinterpret_cast<uint8_t*(__fastcall*)(void*)>(vtbl[0x38 / 8]);
-        pkt_58 = fn_get(msg_obj);
+        auto fn_get = reinterpret_cast<uint8_t*(__fastcall*)(void*, void*)>(vtbl[0x38 / 8]);
+        pkt_58 = fn_get(msg_obj, msg_envelope);
     }
     if (!pkt_58) {
         g_orig_coop_lockstep_on_packet(mgr, a2, msg_id, a4, msg_envelope);
@@ -1419,19 +1438,14 @@ void __fastcall Hook_CoopLockstepOnPacket(uint8_t* mgr, uint64_t a2, int32_t msg
 
     bool clamped_ack = false;
     if (total_players > 2) {
+        int32_t min_ack = orig_ack_tick;
         for (int s = 1; s < total_players && s < 4; ++s) {
-            if (s != static_cast<int>(sender_idx) && g_client_ack_tick[s] < orig_ack_tick) {
+            if (s != static_cast<int>(sender_idx) && g_host_client_valid[s] && g_client_ack_tick[s] < min_ack) {
+                min_ack = g_client_ack_tick[s];
                 clamped_ack = true;
-                break;
             }
         }
         if (clamped_ack) {
-            int32_t min_ack = orig_ack_tick;
-            for (int s = 1; s < total_players && s < 4; ++s) {
-                if (g_client_ack_tick[s] < min_ack) {
-                    min_ack = g_client_ack_tick[s];
-                }
-            }
             *reinterpret_cast<int32_t*>(pkt_58 + 0x3C) = min_ack;
             *reinterpret_cast<uint64_t*>(pkt_58 + 0x40) = 0;
         }
@@ -1453,6 +1467,18 @@ void __fastcall Hook_CoopLockstepOnPacket(uint8_t* mgr, uint64_t a2, int32_t msg
         g_host_client_valid[sender_idx] = true;
     }
     std::memcpy(vanilla_buf, g_host_client_pkt_state[1], 0x58);
+    if (g_host_client_valid[1]) {
+        int32_t min_a34 = *reinterpret_cast<const int32_t*>(g_host_client_pkt_state[1] + 0x34);
+        for (int s = 2; s < 4; ++s) {
+            if (g_host_client_valid[s]) {
+                const int32_t a34 = *reinterpret_cast<const int32_t*>(g_host_client_pkt_state[s] + 0x34);
+                if (a34 < min_a34) {
+                    min_a34 = a34;
+                }
+            }
+        }
+        *reinterpret_cast<int32_t*>(vanilla_buf + 0x34) = min_a34;
+    }
 }
 
 void __fastcall Hook_CoopHostCaptureActions(uint8_t* actions_4p) {
@@ -2141,6 +2167,8 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    g_hold_desired = 0;
+    g_hold_until_ms = 0;
     g_matchmake_peer_cmp_addr = 0;
     g_transport_advert_cmp_addr = 0;
     if (g_hooked_has_channel_for_slot) {
