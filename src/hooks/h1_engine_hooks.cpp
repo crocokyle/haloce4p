@@ -55,14 +55,6 @@ constexpr const char* kSigServerAcceptClient =
 constexpr const char* kSigServerValidateClient =
     "48 89 5C 24 08 57 48 83 EC 20 33 DB 48 8B F9 48 85 D2 74 05 48 8B 0A EB";
 
-// halo1.dll: InitGameSession caller @ 0x180067AB0
-constexpr const char* kSigInitGameSessionCaller =
-    "48 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 50 FD FF FF";
-
-// halo1.dll: Engine event queue @ 0x180093CE0
-constexpr const char* kSigH1EventQueue =
-    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 8D 42 FA 49 8B F8 8B DA 48";
-
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
@@ -95,21 +87,6 @@ uintptr_t g_hooked_get_connected_peers = 0;
 uintptr_t g_hooked_client_handshake = 0;
 uintptr_t g_hooked_server_accept = 0;
 uintptr_t g_hooked_server_validate = 0;
-uintptr_t g_hooked_init_session_caller = 0;
-uintptr_t g_hooked_event_queue = 0;
-uintptr_t g_hooked_gh_notify = 0;
-uintptr_t g_hooked_gh_exit = 0;
-uintptr_t g_hooked_gh_progress = 0;
-uintptr_t g_hooked_gh_278 = 0;
-uintptr_t g_hooked_gh_280 = 0;
-uintptr_t g_hooked_gh_288 = 0;
-uintptr_t g_hooked_gh_298 = 0;
-
-uint32_t g_last_gh_progress_state = 0xFFFFFFFFu;
-uint8_t g_logged_has_player_mask = 0;
-int g_gh_278_count = 0;
-int g_gh_288_count = 0;
-int g_gh_298_count = 0;
 
 const uint8_t* const* g_players_array_ptr = nullptr;
 const uint32_t* g_session_ready_flag_ptr = nullptr;
@@ -161,103 +138,6 @@ FnServerAcceptClient g_orig_server_accept = nullptr;
 
 using FnServerValidateClient = bool(__fastcall*)(const uint8_t* server, const void* slot_ptr);
 FnServerValidateClient g_orig_server_validate = nullptr;
-
-using FnInitGameSessionCaller = void(__fastcall*)(void* a1, void* a2);
-FnInitGameSessionCaller g_orig_init_session_caller = nullptr;
-
-using FnH1EventQueue = void(__fastcall*)(void* self, uint32_t event_id, const uint64_t* payload);
-FnH1EventQueue g_orig_event_queue = nullptr;
-
-using FnGHNotify = void(__fastcall*)(void* self, uint32_t code, uint64_t a3, uint64_t a4);
-FnGHNotify g_orig_gh_notify = nullptr;
-
-using FnGHExit = void(__fastcall*)(void* self, uint32_t code, uint64_t a3);
-FnGHExit g_orig_gh_exit = nullptr;
-
-using FnGHProgress = void(__fastcall*)(void* self, uint32_t state, float progress);
-FnGHProgress g_orig_gh_progress = nullptr;
-
-using FnGHVoid = void(__fastcall*)(void* self);
-FnGHVoid g_orig_gh_278 = nullptr;
-FnGHVoid g_orig_gh_298 = nullptr;
-
-using FnGH280 = bool(__fastcall*)(void* self, uint32_t a2);
-FnGH280 g_orig_gh_280 = nullptr;
-
-using FnGH288 = bool(__fastcall*)(void* self, uint16_t a2, uint16_t a3);
-FnGH288 g_orig_gh_288 = nullptr;
-
-void __fastcall Hook_InitGameSessionCaller(void* a1, void* a2) {
-    uint32_t ready_before = g_session_ready_flag_ptr ? *g_session_ready_flag_ptr : 0xFFFFFFFFu;
-    CE4P_LOG_INFO("[H1] InitGameSessionCaller() enter (session_ready=%u)", ready_before);
-    g_orig_init_session_caller(a1, a2);
-    uint32_t ready_after = g_session_ready_flag_ptr ? *g_session_ready_flag_ptr : 0xFFFFFFFFu;
-    CE4P_LOG_INFO("[H1] InitGameSessionCaller() exit (session_ready=%u)", ready_after);
-}
-
-void __fastcall Hook_H1EventQueue(void* self, uint32_t event_id, const uint64_t* payload) {
-    uint64_t pval = payload ? *payload : 0;
-    CE4P_LOG_INFO("[H1] EventQueue(event=%u, payload=0x%llX)", event_id, static_cast<unsigned long long>(pval));
-    g_orig_event_queue(self, event_id, payload);
-}
-
-void __fastcall Hook_GHNotify(void* self, uint32_t code, uint64_t a3, uint64_t a4) {
-    CE4P_LOG_INFO(
-        "[IGameHost] +0x18 Notify(code=%u, a3=0x%llX, a4=0x%llX)",
-        code,
-        static_cast<unsigned long long>(a3),
-        static_cast<unsigned long long>(a4)
-    );
-    g_orig_gh_notify(self, code, a3, a4);
-}
-
-void __fastcall Hook_GHExit(void* self, uint32_t code, uint64_t a3) {
-    CE4P_LOG_INFO(
-        "[IGameHost] +0x20 OnGameExit(code=%u, a3=0x%llX)",
-        code,
-        static_cast<unsigned long long>(a3)
-    );
-    g_orig_gh_exit(self, code, a3);
-}
-
-void __fastcall Hook_GHProgress(void* self, uint32_t state, float progress) {
-    if (state != g_last_gh_progress_state) {
-        g_last_gh_progress_state = state;
-        CE4P_LOG_INFO("[IGameHost] +0xB8 UpdateProgress(state=%u, progress=%.2f)", state, progress);
-    }
-    g_orig_gh_progress(self, state, progress);
-}
-
-void __fastcall Hook_GH278(void* self) {
-    if (g_gh_278_count < 3) {
-        ++g_gh_278_count;
-        CE4P_LOG_INFO("[IGameHost] +0x278() called (#%d)", g_gh_278_count);
-    }
-    g_orig_gh_278(self);
-}
-
-bool __fastcall Hook_GH280(void* self, uint32_t a2) {
-    bool ret = g_orig_gh_280(self, a2);
-    CE4P_LOG_INFO("[IGameHost] +0x280(a2=%u) -> %d", a2, ret ? 1 : 0);
-    return ret;
-}
-
-bool __fastcall Hook_GH288(void* self, uint16_t a2, uint16_t a3) {
-    bool ret = g_orig_gh_288(self, a2, a3);
-    if (g_gh_288_count < 3) {
-        ++g_gh_288_count;
-        CE4P_LOG_INFO("[IGameHost] +0x288(a2=%u, a3=%u) -> %d (#%d)", a2, a3, ret ? 1 : 0, g_gh_288_count);
-    }
-    return ret;
-}
-
-void __fastcall Hook_GH298(void* self) {
-    if (g_gh_298_count < 3) {
-        ++g_gh_298_count;
-        CE4P_LOG_INFO("[IGameHost] +0x298() called (#%d)", g_gh_298_count);
-    }
-    g_orig_gh_298(self);
-}
 
 int CountActiveServerSlots(const uint8_t* server) {
     if (!server) {
@@ -335,8 +215,6 @@ bool __fastcall Hook_ServerValidateClient(const uint8_t* server, const void* slo
     return ok;
 }
 
-bool __fastcall Hook_HasPlayer(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot);
-
 void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4) {
     if (launch_settings) {
         uint8_t f0 = launch_settings[0];
@@ -353,30 +231,6 @@ void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t
         CE4P_LOG_INFO("[H1] IGameEngineStart(launch_settings=null)");
     }
     g_last_client_hs_key = 0xFFFFFFFFFFFFFFFFull;
-    g_last_gh_progress_state = 0xFFFFFFFFu;
-    g_logged_has_player_mask = 0;
-    g_gh_278_count = 0;
-    g_gh_288_count = 0;
-    g_gh_298_count = 0;
-    if (mcc_iface) {
-        uintptr_t* vt = *reinterpret_cast<uintptr_t**>(mcc_iface);
-        auto hook_vt = [&](const char* name, size_t off, uintptr_t& slot, void* detour, void** orig) {
-            if (!slot && vt[off / 8]) {
-                uintptr_t target = vt[off / 8];
-                if (HookManager::Instance().InstallHook(name, target, detour, orig)) {
-                    slot = target;
-                }
-            }
-        };
-        hook_vt("IGameHost::Notify", 0x18, g_hooked_gh_notify, reinterpret_cast<void*>(&Hook_GHNotify), reinterpret_cast<void**>(&g_orig_gh_notify));
-        hook_vt("IGameHost::OnGameExit", 0x20, g_hooked_gh_exit, reinterpret_cast<void*>(&Hook_GHExit), reinterpret_cast<void**>(&g_orig_gh_exit));
-        hook_vt("IGameHost::UpdateProgress", 0xB8, g_hooked_gh_progress, reinterpret_cast<void*>(&Hook_GHProgress), reinterpret_cast<void**>(&g_orig_gh_progress));
-        hook_vt("IGameHost::P2P_278", 0x278, g_hooked_gh_278, reinterpret_cast<void*>(&Hook_GH278), reinterpret_cast<void**>(&g_orig_gh_278));
-        hook_vt("IGameHost::P2P_280", 0x280, g_hooked_gh_280, reinterpret_cast<void*>(&Hook_GH280), reinterpret_cast<void**>(&g_orig_gh_280));
-        hook_vt("IGameHost::P2P_288", 0x288, g_hooked_gh_288, reinterpret_cast<void*>(&Hook_GH288), reinterpret_cast<void**>(&g_orig_gh_288));
-        hook_vt("IGameHost::P2P_298", 0x298, g_hooked_gh_298, reinterpret_cast<void*>(&Hook_GH298), reinterpret_cast<void**>(&g_orig_gh_298));
-        hook_vt("MCC::HasPlayer", 0x2C0, g_hooked_has_player, reinterpret_cast<void*>(&Hook_HasPlayer), reinterpret_cast<void**>(&g_orig_has_player));
-    }
     g_orig_engine_start(self, mcc_iface, launch_settings, a4);
 }
 
@@ -479,13 +333,6 @@ void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_i
 
 bool __fastcall Hook_HasPlayer(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot) {
     bool real = g_orig_has_player(self, a2, a3, a4, slot);
-    if (slot < 8) {
-        uint8_t bit = static_cast<uint8_t>(1u << slot);
-        if ((g_logged_has_player_mask & bit) == 0) {
-            g_logged_has_player_mask |= bit;
-            CE4P_LOG_INFO("[IGameHost] HasPlayer(slot=%u) -> %d", slot, real ? 1 : 0);
-        }
-    }
     if (g_force_test_players > 1 && slot < static_cast<uint32_t>(g_force_test_players)) {
         if (!real) {
             CE4P_LOG_INFO("[H1] ForceTestPlayerCount: spoofing HasPlayer(slot=%u) -> true", slot);
@@ -766,32 +613,6 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             }
         }
     }
-
-    if (!g_hooked_init_session_caller) {
-        if (auto addr = ProbePattern(span, config, "InitGameSessionCaller", kSigInitGameSessionCaller)) {
-            if (HookManager::Instance().InstallHook(
-                    "H1::InitGameSessionCaller",
-                    *addr,
-                    reinterpret_cast<void*>(&Hook_InitGameSessionCaller),
-                    reinterpret_cast<void**>(&g_orig_init_session_caller)
-                )) {
-                g_hooked_init_session_caller = *addr;
-            }
-        }
-    }
-
-    if (!g_hooked_event_queue) {
-        if (auto addr = ProbePattern(span, config, "H1EventQueue", kSigH1EventQueue)) {
-            if (HookManager::Instance().InstallHook(
-                    "H1::EventQueue",
-                    *addr,
-                    reinterpret_cast<void*>(&Hook_H1EventQueue),
-                    reinterpret_cast<void**>(&g_orig_event_queue)
-                )) {
-                g_hooked_event_queue = *addr;
-            }
-        }
-    }
 }
 
 }  // namespace
@@ -813,22 +634,6 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    auto unhook = [](uintptr_t& slot, auto& orig) {
-        if (slot) {
-            HookManager::Instance().RemoveHook(slot);
-            slot = 0;
-            orig = nullptr;
-        }
-    };
-    unhook(g_hooked_gh_298, g_orig_gh_298);
-    unhook(g_hooked_gh_288, g_orig_gh_288);
-    unhook(g_hooked_gh_280, g_orig_gh_280);
-    unhook(g_hooked_gh_278, g_orig_gh_278);
-    unhook(g_hooked_gh_progress, g_orig_gh_progress);
-    unhook(g_hooked_gh_exit, g_orig_gh_exit);
-    unhook(g_hooked_gh_notify, g_orig_gh_notify);
-    unhook(g_hooked_event_queue, g_orig_event_queue);
-    unhook(g_hooked_init_session_caller, g_orig_init_session_caller);
     if (g_hooked_server_validate) {
         HookManager::Instance().RemoveHook(g_hooked_server_validate);
         g_hooked_server_validate = 0;
