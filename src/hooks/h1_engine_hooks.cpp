@@ -43,12 +43,28 @@ constexpr const char* kSigWaitForPeers =
 constexpr const char* kSigNetworkSession =
     "4C 8B DC 48 83 EC 68 33 C0 38 05 ? ? ? ? 74 66 48 8B 0D";
 
+// halo1.dll: Co-op client handshake state machine @ 0x180AEEDD4 (loads client* at +0x04)
+constexpr const char* kSigClientHandshakeTick =
+    "48 83 EC 28 48 8B 0D ? ? ? ? 45 33 C0 0F B7 91 6E 14 00 00 85 D2 74";
+
+// halo1.dll: Co-op host accept new client @ 0x180B5BED8
+constexpr const char* kSigServerAcceptClient =
+    "48 89 5C 24 18 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 50 48 8B 05";
+
+// halo1.dll: Co-op host validate client @ 0x180B5BDCC
+constexpr const char* kSigServerValidateClient =
+    "48 89 5C 24 08 57 48 83 EC 20 33 DB 48 8B F9 48 85 D2 74 05 48 8B 0A EB";
+
 constexpr const char* kSigLockstepInputBuffer = "";
 constexpr const char* kSigGameCreatePlayer = "";
 constexpr const char* kSigCoopRespawnCheck = "";
 
 constexpr uintptr_t kRvaCoopPlayerCount = 0x01B7B910;
 constexpr uintptr_t kRvaMccGameInterface = 0x02E3B9A0;
+constexpr uintptr_t kRvaGameModeFlags = 0x02E3B821;
+constexpr uintptr_t kRvaDisconnectReason = 0x02EA3358;
+constexpr uintptr_t kRvaClientReadyFlag = 0x02EA33A7;
+constexpr uintptr_t kRvaH1ServerPtr = 0x02EA33C0;
 constexpr size_t kPlayerDatumStride = 0xC20;
 constexpr size_t kPlayerDatumUnitOffset = 0x64;
 constexpr size_t kDataArrayOffsetToData = 0x34;
@@ -68,6 +84,9 @@ uintptr_t g_hooked_engine_start = 0;
 uintptr_t g_hooked_session_ready = 0;
 uintptr_t g_hooked_wait_for_peers = 0;
 uintptr_t g_hooked_get_connected_peers = 0;
+uintptr_t g_hooked_client_handshake = 0;
+uintptr_t g_hooked_server_accept = 0;
+uintptr_t g_hooked_server_validate = 0;
 
 const uint8_t* const* g_players_array_ptr = nullptr;
 const uint32_t* g_session_ready_flag_ptr = nullptr;
@@ -77,6 +96,8 @@ uint32_t g_last_connected_peers_logged = 0xFFFFFFFFu;
 const uint8_t* const* g_network_session_ptr = nullptr;
 uint32_t g_last_net_state_logged = 0xFFFFFFFFu;
 uint32_t g_last_net_conn_logged = 0xFFFFFFFFu;
+const uint8_t* const* g_h1_client_ptr = nullptr;
+uint64_t g_last_client_hs_key = 0xFFFFFFFFFFFFFFFFull;
 
 using FnCreateGameEngine = int(__fastcall*)(void** out_engine);
 FnCreateGameEngine g_orig_create_game_engine = nullptr;
@@ -109,6 +130,91 @@ using FnGetConnectedPeers = uint32_t(__fastcall*)();
 FnGetConnectedPeers g_fn_get_connected_peers = nullptr;
 FnGetConnectedPeers g_orig_get_connected_peers = nullptr;
 
+using FnClientHandshakeTick = bool(__fastcall*)();
+FnClientHandshakeTick g_orig_client_handshake = nullptr;
+
+using FnServerAcceptClient = bool(__fastcall*)(const uint8_t* server, const void* peer_addr);
+FnServerAcceptClient g_orig_server_accept = nullptr;
+
+using FnServerValidateClient = bool(__fastcall*)(const uint8_t* server, const void* slot_ptr);
+FnServerValidateClient g_orig_server_validate = nullptr;
+
+int CountActiveServerSlots(const uint8_t* server) {
+    if (!server) {
+        return -1;
+    }
+    int active = 0;
+    for (int i = 0; i < 17; ++i) {
+        int16_t slot_id = *reinterpret_cast<const int16_t*>(server + 0xC60 + static_cast<size_t>(i) * 0x200);
+        if (slot_id != -1) {
+            ++active;
+        }
+    }
+    return active;
+}
+
+bool __fastcall Hook_ClientHandshakeTick() {
+    bool ok = g_orig_client_handshake();
+    if (g_h1_client_ptr && g_h1_base) {
+        const uint8_t* client = *g_h1_client_ptr;
+        uint16_t state = client ? *reinterpret_cast<const uint16_t*>(client + 0x146E) : 0xFFFFu;
+        uint16_t sub = client ? *reinterpret_cast<const uint16_t*>(client + 0x1470) : 0xFFFFu;
+        uint8_t ready = *reinterpret_cast<const uint8_t*>(g_h1_base + kRvaClientReadyFlag);
+        int16_t reason = *reinterpret_cast<const int16_t*>(g_h1_base + kRvaDisconnectReason);
+        uint32_t conn_flags = 0;
+        if (client) {
+            const uint8_t* conn = *reinterpret_cast<const uint8_t* const*>(client + 0x7D8);
+            if (conn) {
+                conn_flags = *reinterpret_cast<const uint32_t*>(conn + 0x9DC);
+            }
+        }
+        uint64_t key = (static_cast<uint64_t>(state) << 48) |
+                       (static_cast<uint64_t>(sub) << 32) |
+                       (static_cast<uint64_t>(static_cast<uint16_t>(reason)) << 16) |
+                       (static_cast<uint64_t>(ready) << 8) |
+                       (ok ? 1ull : 0ull);
+        if (key != g_last_client_hs_key) {
+            g_last_client_hs_key = key;
+            CE4P_LOG_INFO(
+                "[H1] ClientHandshake(state=%u, sub=%u, ready=%u, reason=%d, conn_flags=0x%X) -> ok=%d",
+                state,
+                sub,
+                ready,
+                static_cast<int>(reason),
+                conn_flags,
+                ok ? 1 : 0
+            );
+        }
+    }
+    return ok;
+}
+
+bool __fastcall Hook_ServerAcceptClient(const uint8_t* server, const void* peer_addr) {
+    bool ok = g_orig_server_accept(server, peer_addr);
+    uint16_t s_state = server ? *reinterpret_cast<const uint16_t*>(server + 0x08) : 0xFFFFu;
+    uint8_t s_flags = server ? *reinterpret_cast<const uint8_t*>(server + 0x0A) : 0;
+    int active = CountActiveServerSlots(server);
+    CE4P_LOG_INFO(
+        "[H1] ServerAcceptClient(peer=0x%llX) -> ok=%d, srv_state=%u, srv_flags=0x%02X, active_slots=%d",
+        reinterpret_cast<unsigned long long>(peer_addr),
+        ok ? 1 : 0,
+        s_state,
+        s_flags,
+        active
+    );
+    return ok;
+}
+
+bool __fastcall Hook_ServerValidateClient(const uint8_t* server, const void* slot_ptr) {
+    bool ok = g_orig_server_validate(server, slot_ptr);
+    CE4P_LOG_INFO(
+        "[H1] ServerValidateClient(slot=0x%llX) -> ok=%d",
+        reinterpret_cast<unsigned long long>(slot_ptr),
+        ok ? 1 : 0
+    );
+    return ok;
+}
+
 void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t* launch_settings, void* a4) {
     if (launch_settings) {
         uint8_t f0 = launch_settings[0];
@@ -124,6 +230,7 @@ void __fastcall Hook_IGameEngineStart(void* self, void* mcc_iface, const uint8_t
     } else {
         CE4P_LOG_INFO("[H1] IGameEngineStart(launch_settings=null)");
     }
+    g_last_client_hs_key = 0xFFFFFFFFFFFFFFFFull;
     g_orig_engine_start(self, mcc_iface, launch_settings, a4);
 }
 
@@ -266,11 +373,18 @@ uint64_t __fastcall Hook_InitGameSession(void* a1, void* a2, void* a3, uint32_t 
     uint64_t ret = g_orig_init_game_session(a1, a2, a3, a4);
     if (g_h1_base) {
         auto* coop_count = reinterpret_cast<const int16_t*>(g_h1_base + kRvaCoopPlayerCount);
+        const uint8_t* flags = reinterpret_cast<const uint8_t*>(g_h1_base + kRvaGameModeFlags);
+        const uint8_t* srv = *reinterpret_cast<const uint8_t* const*>(g_h1_base + kRvaH1ServerPtr);
+        uint16_t srv_state = srv ? *reinterpret_cast<const uint16_t*>(srv + 0x08) : 0xFFFFu;
+        int srv_slots = CountActiveServerSlots(srv);
         CE4P_LOG_INFO(
-            "[H1] InitGameSession(a4=%u) -> ret=0x%llX, game_coop_player_count=%d",
+            "[H1] InitGameSession(a4=%u) -> ret=0x%llX, local_players=%d, flags=[%u,%u,%u,%u], srv_state=%u, srv_slots=%d",
             a4,
             static_cast<unsigned long long>(ret),
-            static_cast<int>(*coop_count)
+            static_cast<int>(*coop_count),
+            flags[0], flags[1], flags[2], flags[3],
+            srv_state,
+            srv_slots
         );
     }
     if (g_network_session_ptr) {
@@ -457,6 +571,48 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
             }
         }
     }
+
+    if (!g_hooked_client_handshake) {
+        if (auto addr = ProbePattern(span, config, "ClientHandshakeTick", kSigClientHandshakeTick)) {
+            if (uintptr_t cli_ptr = ResolveRipRelative(*addr + 0x04, 3, 7)) {
+                g_h1_client_ptr = reinterpret_cast<const uint8_t* const*>(cli_ptr);
+            }
+            if (HookManager::Instance().InstallHook(
+                    "H1::ClientHandshakeTick",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_ClientHandshakeTick),
+                    reinterpret_cast<void**>(&g_orig_client_handshake)
+                )) {
+                g_hooked_client_handshake = *addr;
+            }
+        }
+    }
+
+    if (!g_hooked_server_accept) {
+        if (auto addr = ProbePattern(span, config, "ServerAcceptClient", kSigServerAcceptClient)) {
+            if (HookManager::Instance().InstallHook(
+                    "H1::ServerAcceptClient",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_ServerAcceptClient),
+                    reinterpret_cast<void**>(&g_orig_server_accept)
+                )) {
+                g_hooked_server_accept = *addr;
+            }
+        }
+    }
+
+    if (!g_hooked_server_validate) {
+        if (auto addr = ProbePattern(span, config, "ServerValidateClient", kSigServerValidateClient)) {
+            if (HookManager::Instance().InstallHook(
+                    "H1::ServerValidateClient",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_ServerValidateClient),
+                    reinterpret_cast<void**>(&g_orig_server_validate)
+                )) {
+                g_hooked_server_validate = *addr;
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -478,6 +634,23 @@ void RescanIfLoaded(const ModConfig& config) {
 
 void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_hooked_server_validate) {
+        HookManager::Instance().RemoveHook(g_hooked_server_validate);
+        g_hooked_server_validate = 0;
+        g_orig_server_validate = nullptr;
+    }
+    if (g_hooked_server_accept) {
+        HookManager::Instance().RemoveHook(g_hooked_server_accept);
+        g_hooked_server_accept = 0;
+        g_orig_server_accept = nullptr;
+    }
+    if (g_hooked_client_handshake) {
+        HookManager::Instance().RemoveHook(g_hooked_client_handshake);
+        g_hooked_client_handshake = 0;
+        g_orig_client_handshake = nullptr;
+    }
+    g_h1_client_ptr = nullptr;
+    g_last_client_hs_key = 0xFFFFFFFFFFFFFFFFull;
     if (g_hooked_get_connected_peers) {
         HookManager::Instance().RemoveHook(g_hooked_get_connected_peers);
         g_hooked_get_connected_peers = 0;

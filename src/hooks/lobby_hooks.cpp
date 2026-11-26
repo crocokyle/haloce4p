@@ -33,6 +33,12 @@ constexpr const char* kSigLobbySecondaryCap =
 // MCC-Win64-Shipping.exe: Squad::GetTotalPlayerCount() @ 0x14025119C
 constexpr const char* kSigGetTotalPlayerCount =
     "40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? E8 ? ? ? ? 8B 8B 20 0D 00 00 3B C1 0F 47 C8 8B C1";
+// MCC-Win64-Shipping.exe: ShowConnectionLostDialog(rcx) @ 0x14039CA4C
+constexpr const char* kSigShowConnectionLostDialog =
+    "40 53 48 83 EC 30 8B 51 24 48 8B D9 83 EA 01 74 29 83 FA 01 75 62 45 33";
+// MCC-Win64-Shipping.exe: OnGameEngineExit(rcx, dl) @ 0x14039CAD0
+constexpr const char* kSigOnGameEngineExit =
+    "48 89 5C 24 08 57 48 83 EC 30 83 79 20 07 40 8A FA 48 8B D9 0F 84 BB 00";
 
 constexpr size_t kVtableIdxGetMaxCampaignPlayers = 0x238 / 8;
 
@@ -56,6 +62,26 @@ FnGetMaxCampaignPlayers g_orig_get_max_campaign_players = nullptr;
 
 using FnGetTotalPlayerCount = uint32_t(__fastcall*)(void* squad);
 FnGetTotalPlayerCount g_orig_get_total_player_count = nullptr;
+
+using FnShowConnectionLostDialog = void(__fastcall*)(const uint8_t* session_ui);
+FnShowConnectionLostDialog g_orig_show_connection_lost = nullptr;
+
+using FnOnGameEngineExit = void(__fastcall*)(const uint8_t* session_ui, uint8_t flag);
+FnOnGameEngineExit g_orig_on_game_engine_exit = nullptr;
+
+void __fastcall Hook_ShowConnectionLostDialog(const uint8_t* session_ui) {
+    uint32_t state = session_ui ? *reinterpret_cast<const uint32_t*>(session_ui + 0x20) : 0;
+    uint32_t reason = session_ui ? *reinterpret_cast<const uint32_t*>(session_ui + 0x24) : 0;
+    CE4P_LOG_WARN("[Lobby] ShowConnectionLostDialog(reason=%u, state=%u)", reason, state);
+    g_orig_show_connection_lost(session_ui);
+}
+
+void __fastcall Hook_OnGameEngineExit(const uint8_t* session_ui, uint8_t flag) {
+    uint32_t state = session_ui ? *reinterpret_cast<const uint32_t*>(session_ui + 0x20) : 0;
+    uint32_t reason = session_ui ? *reinterpret_cast<const uint32_t*>(session_ui + 0x24) : 0;
+    CE4P_LOG_INFO("[Lobby] OnGameEngineExit(flag=%u, state=%u, reason=%u)", flag, state, reason);
+    g_orig_on_game_engine_exit(session_ui, flag);
+}
 
 bool __fastcall Hook_DeserializeGameDef(void* def, void* json) {
     bool ok = g_orig_deserialize_game_def(def, json);
@@ -213,6 +239,28 @@ void Rescan(const ModConfig& config) {
                 *addr,
                 reinterpret_cast<void*>(&Hook_GetTotalPlayerCount),
                 reinterpret_cast<void**>(&g_orig_get_total_player_count)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "ShowConnectionLostDialog", kSigShowConnectionLostDialog)) {
+        if (!g_orig_show_connection_lost) {
+            HookManager::Instance().InstallHook(
+                "MCC::ShowConnectionLostDialog",
+                *addr,
+                reinterpret_cast<void*>(&Hook_ShowConnectionLostDialog),
+                reinterpret_cast<void**>(&g_orig_show_connection_lost)
+            );
+        }
+    }
+
+    if (auto addr = ProbePattern(*mcc_span, config, "OnGameEngineExit", kSigOnGameEngineExit)) {
+        if (!g_orig_on_game_engine_exit) {
+            HookManager::Instance().InstallHook(
+                "MCC::OnGameEngineExit",
+                *addr,
+                reinterpret_cast<void*>(&Hook_OnGameEngineExit),
+                reinterpret_cast<void**>(&g_orig_on_game_engine_exit)
             );
         }
     }
