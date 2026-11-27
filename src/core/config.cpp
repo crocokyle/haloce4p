@@ -100,16 +100,22 @@ MissionSpawnConfig ParseMissionSpawnValue(const std::string& val,
 
 std::unordered_map<std::string, MissionSpawnConfig> DefaultMissionSpawns() {
     std::unordered_map<std::string, MissionSpawnConfig> m;
-    // a10: Pillar of Autumn — Player 0 starts locked in cryochamber
-    m["a10"] = MissionSpawnConfig{true, false, 45, 0.0f, -0.8f, 0.05f, false};
-    // a30: Halo — Players 1 and 2 spawn overlapping during/after intro
-    m["a30"] = MissionSpawnConfig{false, true, 45, 0.8f, 0.0f, 0.05f, true};
-    // a50: Truth and Reconciliation — Player 0 starts seated in Pelican
-    m["a50"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false};
-    // c10: 343 Guilty Spark — Players 2..3 start seated in Pelican
-    m["c10"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false};
-    // c40: Two Betrayals — Players 0 and 1 spawn overlapping in Control Room
-    m["c40"] = MissionSpawnConfig{false, true, 45, 0.8f, 0.0f, 0.05f, false};
+    // Only p3 and p4 have default offsets; p1 and p2 stay on original spawns unless overridden.
+    // a10: Pillar of Autumn
+    m["a10.p3"] = MissionSpawnConfig{true, false, 45, 0.0f, -0.8f, 0.05f, false, true};
+    m["a10.p4"] = MissionSpawnConfig{true, false, 45, 0.0f, -1.2f, 0.05f, false, true};
+    // a30: Halo
+    m["a30.p3"] = MissionSpawnConfig{false, true, 45, 0.8f, 0.0f, 0.05f, true, true};
+    m["a30.p4"] = MissionSpawnConfig{false, true, 45, -0.8f, 0.0f, 0.05f, true, true};
+    // a50: Truth and Reconciliation
+    m["a50.p3"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false, true};
+    m["a50.p4"] = MissionSpawnConfig{true, false, 45, 0.0f, 1.2f, 0.05f, false, true};
+    // c10: 343 Guilty Spark
+    m["c10.p3"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false, true};
+    m["c10.p4"] = MissionSpawnConfig{true, false, 45, 0.0f, 1.2f, 0.05f, false, true};
+    // c40: Two Betrayals
+    m["c40.p3"] = MissionSpawnConfig{false, true, 45, 0.8f, 0.0f, 0.05f, false, true};
+    m["c40.p4"] = MissionSpawnConfig{false, true, 45, -0.8f, 0.0f, 0.05f, false, true};
     return m;
 }
 
@@ -124,7 +130,7 @@ std::string ModConfig::GetSignature(const std::string& key, const char* fallback
 MissionSpawnConfig ModConfig::GetMissionSpawn(const std::string& map_name, int player_index) const {
     const std::string map_key = ToLower(map_name);
     if (player_index >= 0 && player_index < 4) {
-        const auto pit = mission_spawns.find(map_key + ".p" + std::to_string(player_index));
+        const auto pit = mission_spawns.find(map_key + ".p" + std::to_string(player_index + 1));
         if (pit != mission_spawns.end()) {
             return pit->second;
         }
@@ -180,7 +186,7 @@ ModConfig ParseConfigText(const std::string& text) {
                 const bool is_player_override =
                     (dot != std::string::npos && map_key.size() == dot + 3 &&
                      map_key[dot + 1] == 'p' &&
-                     map_key[dot + 2] >= '0' && map_key[dot + 2] <= '3');
+                     map_key[dot + 2] >= '1' && map_key[dot + 2] <= '4');
                 MissionSpawnConfig base{};
                 if (const auto it = cfg.mission_spawns.find(map_key); it != cfg.mission_spawns.end()) {
                     base = it->second;

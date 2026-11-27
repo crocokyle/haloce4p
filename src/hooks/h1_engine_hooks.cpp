@@ -355,7 +355,7 @@ bool GetMissionSpawnRules(const char* map_name, MissionSpawnConfig out[4]) {
     const MissionSpawnConfig base = (base_it != g_mission_spawns.end()) ? base_it->second : MissionSpawnConfig{};
     bool any_active = false;
     for (int i = 0; i < 4; ++i) {
-        const auto pit = g_mission_spawns.find(key + ".p" + std::to_string(i));
+        const auto pit = g_mission_spawns.find(key + ".p" + std::to_string(i + 1));
         out[i] = (pit != g_mission_spawns.end()) ? pit->second : base;
         if (out[i].eject || out[i].separate) {
             any_active = true;

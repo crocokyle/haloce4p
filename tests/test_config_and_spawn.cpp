@@ -25,9 +25,9 @@ GameCreatePlayer = 48 89 5C 24 ? 57
 
 [MissionSpawns]
 a10 = eject, x=0.25, y=-1.2, z=0.10, delay=2.0, cutscene=false
-a10.p0 = y=-1.6, z=0.0
+a10.p1 = y=-1.6, z=0.0
 b30 = both, x=1.0, y=0.5, z=0.0, delay_ticks=60, cutscene=true
-c40 = none
+c40.p3 = none
 )";
 
     ce4p::ModConfig cfg = ce4p::ParseConfigText(ini);
@@ -42,31 +42,33 @@ c40 = none
     assert(cfg.GetSignature("GameCreatePlayer", "") == "48 89 5C 24 ? 57");
     assert(cfg.GetSignature("MissingKey", "DEFAULT") == "DEFAULT");
 
-    // Built-in default preserved for a30
-    const auto a30 = cfg.GetMissionSpawn("a30", 1);
-    assert(!a30.eject && a30.separate && a30.during_cutscene);
-    assert(std::fabs(a30.offset_x - 0.8f) < 1e-5f);
+    // Built-in default preserved for a30: p1/p2 untouched, p3 has separate+cutscene
+    const auto a30_p1 = cfg.GetMissionSpawn("a30", 0);
+    assert(!a30_p1.eject && !a30_p1.separate);
+    const auto a30_p3 = cfg.GetMissionSpawn("a30", 2);
+    assert(!a30_p3.eject && a30_p3.separate && a30_p3.during_cutscene && a30_p3.custom_offset);
+    assert(std::fabs(a30_p3.offset_x - 0.8f) < 1e-5f);
 
-    // Overridden a10, per-player a10.p0 inheritance, newly added b30, and disabled c40
-    const auto a10_p1 = cfg.GetMissionSpawn("a10", 1);
-    assert(a10_p1.eject && !a10_p1.separate && a10_p1.delay_ticks == 60 && !a10_p1.custom_offset);
+    // Overridden a10, per-player a10.p1 inheritance, newly added b30, and disabled c40.p3
+    const auto a10_p2 = cfg.GetMissionSpawn("a10", 1);
+    assert(a10_p2.eject && !a10_p2.separate && a10_p2.delay_ticks == 60 && !a10_p2.custom_offset);
+    assert(std::fabs(a10_p2.offset_x - 0.25f) < 1e-5f);
+    assert(std::fabs(a10_p2.offset_y - (-1.2f)) < 1e-5f);
+    assert(std::fabs(a10_p2.offset_z - 0.10f) < 1e-5f);
+
+    const auto a10_p1 = cfg.GetMissionSpawn("a10", 0);
+    assert(a10_p1.eject && a10_p1.delay_ticks == 60 && a10_p1.custom_offset);
     assert(std::fabs(a10_p1.offset_x - 0.25f) < 1e-5f);
-    assert(std::fabs(a10_p1.offset_y - (-1.2f)) < 1e-5f);
-    assert(std::fabs(a10_p1.offset_z - 0.10f) < 1e-5f);
-
-    const auto a10_p0 = cfg.GetMissionSpawn("a10", 0);
-    assert(a10_p0.eject && a10_p0.delay_ticks == 60 && a10_p0.custom_offset);
-    assert(std::fabs(a10_p0.offset_x - 0.25f) < 1e-5f);
-    assert(std::fabs(a10_p0.offset_y - (-1.6f)) < 1e-5f);
-    assert(std::fabs(a10_p0.offset_z - 0.0f) < 1e-5f);
+    assert(std::fabs(a10_p1.offset_y - (-1.6f)) < 1e-5f);
+    assert(std::fabs(a10_p1.offset_z - 0.0f) < 1e-5f);
 
     const auto b30 = cfg.GetMissionSpawn("b30", 2);
     assert(b30.eject && b30.separate && b30.delay_ticks == 60 && b30.during_cutscene);
     assert(std::fabs(b30.offset_x - 1.0f) < 1e-5f);
     assert(std::fabs(b30.offset_y - 0.5f) < 1e-5f);
 
-    const auto c40 = cfg.GetMissionSpawn("c40", 0);
-    assert(!c40.eject && !c40.separate);
+    const auto c40_p3 = cfg.GetMissionSpawn("c40", 2);
+    assert(!c40_p3.eject && !c40_p3.separate);
 }
 
 void TestSpawnHelper() {
