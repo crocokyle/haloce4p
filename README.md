@@ -4,6 +4,8 @@ Play Halo: Combat Evolved's campaign online with up to **4 players** in **Halo: 
 
 > **Important:** All players in the co-op session must have this mod installed and launch MCC with **Easy Anti-Cheat (EAC) Disabled**.
 
+See **[ROADMAP.md](ROADMAP.md)** for the current 10-mission co-op status and our path to `v2.0.0` (full campaign playable).
+
 ---
 
 ## Installation (Players)
@@ -24,9 +26,10 @@ Play Halo: Combat Evolved's campaign online with up to **4 players** in **Halo: 
   *(Tip: In Steam, right-click **Halo: The Master Chief Collection** → **Manage** → **Browse local files**, then open `MCC` → `Binaries` → `Win64`.)*
 
 ### Step 2: Copy the mod files
-Download or build `version.dll` and copy **both** of these files into the `Win64` folder (right next to `MCC-Win64-Shipping.exe`):
+Download or build `version.dll` and copy these files into the `Win64` folder (right next to `MCC-Win64-Shipping.exe`):
 - `version.dll`
 - `ce_4player.ini`
+- `ce_4player_spawns.ini` *(optional on clients — the host's file is synced automatically)*
 
 ### Step 3: Linux / Proton / SteamOS only
 If you are playing on Linux (via Proton), Steam/Wine will ignore local `version.dll` files unless you tell it to load them:
