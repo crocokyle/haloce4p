@@ -60,6 +60,10 @@ constexpr const char* kSigServerAcceptClient =
 constexpr const char* kSigServerValidateClient =
     "48 89 5C 24 08 57 48 83 EC 20 33 DB 48 8B F9 48 85 D2 74 05 48 8B 0A EB";
 
+// halo1.dll: player_add_equipment(unit_datum, profile_idx, reset_weapons) @ 0x180AD0174
+constexpr const char* kSigPlayerAddEquipment =
+    "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 48 89 78 20 41 54 41 56 41 57 48 83 EC 20 41 83 CC FF 45 8A F8 0F B7 F2";
+
 // halo1.dll: MatchMake_campaign_net @ 0x180065F70 (loads net_active at +0x42, is_host at +0x4F)
 constexpr const char* kSigMatchMakeCampaignNet =
     "48 8B C4 55 41 54 41 55 41 56 41 57 48 8D A8 C8 FC FF FF 48 81 EC 10 04 00 00 "
@@ -293,6 +297,14 @@ int32_t g_player_stuck_ticks[4]{};
 int32_t g_opening_diag_ticks = 0;
 bool g_overlap_sep_done[4]{};
 std::atomic<bool> g_cinematic_active{false};
+bool g_has_p0_teleport = false;
+uint16_t g_last_p0_teleport_flag = 0;
+bool g_last_p0_teleport_reset = false;
+uint32_t g_last_seen_unit[4]{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+bool g_has_p0_profile = false;
+uint16_t g_last_p0_profile = 0;
+bool g_last_p0_profile_reset = false;
+int32_t g_equipped_profile[4]{-1, -1, -1, -1};
 
 std::mutex g_mission_spawns_mu;
 std::string g_config_path;
@@ -438,6 +450,10 @@ FnSerializeAction g_fn_serialize_action = nullptr;
 
 using FnDeserializeAction = void(__fastcall*)(void* net_action_30, void* bitstream);
 FnDeserializeAction g_fn_deserialize_action = nullptr;
+
+using FnPlayerAddEquipment = void(__fastcall*)(uint32_t unit_datum, uint16_t profile_idx, bool reset_weapons);
+FnPlayerAddEquipment g_orig_player_add_equipment = nullptr;
+uintptr_t g_hooked_player_add_equipment = 0;
 
 using FnSerializeClientInputVTable = void(__fastcall*)(void* factory, uint8_t** pkt_58_ptr, void* bitstream);
 FnSerializeClientInputVTable g_orig_serialize_client_input_vtbl = nullptr;
@@ -861,11 +877,14 @@ void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_i
     if (object_index != p0_unit) {
         return;
     }
+    g_has_p0_teleport = true;
+    g_last_p0_teleport_flag = flag_index;
+    g_last_p0_teleport_reset = reset;
 
     in_catchup = true;
     int slot = 1;
     while ((datum = g_fn_datum_next(players_arr, datum)) != -1) {
-        if (slot >= 2) {
+        if (slot >= 1) {
             const uint8_t* pi = data_base + static_cast<size_t>(datum & 0xFFFF) * kPlayerDatumStride;
             uint32_t unit_obj = *reinterpret_cast<const uint32_t*>(pi + kPlayerDatumUnitOffset);
             if (unit_obj != 0xFFFFFFFF && unit_obj != object_index) {
@@ -882,6 +901,73 @@ void __fastcall Hook_ObjectTeleportToFlag(uint32_t object_index, uint16_t flag_i
         ++slot;
     }
     in_catchup = false;
+}
+
+void __fastcall Hook_PlayerAddEquipment(uint32_t unit_datum, uint16_t profile_idx, bool reset_weapons) {
+    g_orig_player_add_equipment(unit_datum, profile_idx, reset_weapons);
+
+    static thread_local bool in_equip = false;
+    if (in_equip || unit_datum == 0xFFFFFFFFu) {
+        return;
+    }
+    CE4P_LOG_INFO("[H1] PlayerAddEquipment(unit=0x%X, profile=%u, reset=%d)",
+                  unit_datum, profile_idx, reset_weapons ? 1 : 0);
+    if (!g_players_array_ptr || !g_fn_datum_next) {
+        return;
+    }
+    const uint8_t* players_arr = *g_players_array_ptr;
+    if (!players_arr) {
+        return;
+    }
+    const int32_t data_off = *reinterpret_cast<const int32_t*>(players_arr + kDataArrayOffsetToData);
+    const uint8_t* data_base = players_arr + data_off;
+
+    // Collect current player units (0..3) and mark the caller's unit as equipped for this profile.
+    uint32_t units[4]{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    int count = 0;
+    int32_t datum = -1;
+    while (count < 4 && (datum = g_fn_datum_next(players_arr, datum)) != -1) {
+        units[count] = *reinterpret_cast<const uint32_t*>(
+            data_base + static_cast<size_t>(datum & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset
+        );
+        if (units[count] == unit_datum) {
+            g_equipped_profile[count] = static_cast<int32_t>(profile_idx);
+        }
+        ++count;
+    }
+
+    if (unit_datum == units[0]) {
+        g_has_p0_profile = true;
+        g_last_p0_profile = profile_idx;
+        g_last_p0_profile_reset = reset_weapons;
+    } else if (profile_idx != 0 && !g_has_p0_profile) {
+        g_has_p0_profile = true;
+        g_last_p0_profile = profile_idx;
+        g_last_p0_profile_reset = reset_weapons;
+    }
+
+    // Mirror non-zero equipment grants (e.g. bridge pistol) to any player 0..3 who hasn't received one yet,
+    // and mirror profile=0 to extra players (slot >= 2) if p0 received it.
+    in_equip = true;
+    for (int i = 0; i < count; ++i) {
+        if (units[i] == 0xFFFFFFFFu || units[i] == unit_datum) {
+            continue;
+        }
+        if (profile_idx == 0 && (unit_datum != units[0] || i < 2)) {
+            continue;
+        }
+        if (g_equipped_profile[i] == static_cast<int32_t>(profile_idx)) {
+            continue;
+        }
+        if (profile_idx != 0 && g_equipped_profile[i] > 0) {
+            continue;
+        }
+        g_equipped_profile[i] = static_cast<int32_t>(profile_idx);
+        g_orig_player_add_equipment(units[i], profile_idx, reset_weapons);
+        CE4P_LOG_INFO("[H1] PlayerAddEquipment: mirrored profile=%u to player[%d] unit=0x%X",
+                      profile_idx, i, units[i]);
+    }
+    in_equip = false;
 }
 
 bool __fastcall Hook_HasPlayer(void* self, uint64_t a2, uint64_t a3, uint64_t a4, uint32_t slot) {
@@ -1537,8 +1623,8 @@ char __fastcall Hook_TransportSendPacket(
             }
         } else if (local_player_idx > 0 && (msg_id == msg_input || msg_id == msg_camera)) {
             target_slot_mask = 1u;
-        } else if (transport0 == GetTransportFromSession0() && msg_id != msg_lockstep && msg_id != msg_camera && msg_id != msg_input) {
-            static std::atomic<int> nonlock_diag_budget{30};
+        } else if (transport0 == GetTransportFromSession0() && msg_id != msg_lockstep && msg_id != msg_camera && msg_id != msg_input && msg_id != 21) {
+            static std::atomic<int> nonlock_diag_budget{40};
             if (nonlock_diag_budget.fetch_sub(1) > 0) {
                 CE4P_LOG_INFO("[H1] SendPktOther(msg=%d, mask=0x%X, bits=%u, local_pidx=%d)",
                               msg_id, target_slot_mask, pkt_bits, local_player_idx);
@@ -1886,6 +1972,13 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
         return;
     }
     const int32_t local_idx = *reinterpret_cast<const int32_t*>(g_h1_base + kRvaCoopLocalPlayerIndex);
+    if ((*valid_mask_ptr & 0x1u) == 0 && g_opening_diag_ticks > 100) {
+        static std::atomic<int> stall_diag_budget{10};
+        if (stall_diag_budget.fetch_sub(1) > 0) {
+            CE4P_LOG_INFO("[H1] ApplyActions stalled: local=%d mask=0x%X had_q=%d peek_tick=%u",
+                          local_idx, *valid_mask_ptr, had_queued_frame ? 1 : 0, peeked_tick);
+        }
+    }
     if (local_idx == 0 && (*valid_mask_ptr & 0x2u) != 0) {
         std::lock_guard<std::mutex> lock(g_lockstep_mutex);
         for (int s = 2; s < total_players && s < 4; ++s) {
@@ -1909,6 +2002,37 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
             if (total_players >= 4) {
                 UnswizzleNetActionToBlam(copy.p3_swizzled, actions_4p + 3 * 0x30);
                 *valid_mask_ptr |= (1u << 3);
+            }
+        }
+    }
+
+    // Late-spawn catchup: if p2..p4 spawn their unit after p1 already teleported or got equipment, sync them.
+    if ((*valid_mask_ptr & 0x1u) != 0 && g_players_array_ptr && g_fn_datum_next) {
+        const uint8_t* players_arr = *g_players_array_ptr;
+        if (players_arr) {
+            const int32_t data_off = *reinterpret_cast<const int32_t*>(players_arr + kDataArrayOffsetToData);
+            const uint8_t* data_base = players_arr + data_off;
+            int idx = 0;
+            int32_t d = -1;
+            while (idx < 4 && (d = g_fn_datum_next(players_arr, d)) != -1) {
+                const uint32_t unit_obj = *reinterpret_cast<const uint32_t*>(
+                    data_base + static_cast<size_t>(d & 0xFFFF) * kPlayerDatumStride + kPlayerDatumUnitOffset
+                );
+                if (idx >= 1 && unit_obj != 0xFFFFFFFFu && unit_obj != g_last_seen_unit[idx]) {
+                    if (g_enable_catchup_teleport && g_has_p0_teleport && g_orig_object_teleport_to_flag && g_fn_post_teleport) {
+                        g_orig_object_teleport_to_flag(unit_obj, g_last_p0_teleport_flag, g_last_p0_teleport_reset);
+                        g_fn_post_teleport(unit_obj);
+                        CE4P_LOG_INFO("[H1] LateSpawnTeleport: player[%d] unit=0x%X -> flag=%u",
+                                      idx, unit_obj, g_last_p0_teleport_flag);
+                    }
+                    if (g_has_p0_profile && g_last_p0_profile != 0 && g_orig_player_add_equipment) {
+                        g_orig_player_add_equipment(unit_obj, g_last_p0_profile, g_last_p0_profile_reset);
+                        CE4P_LOG_INFO("[H1] LateSpawnEquip: player[%d] unit=0x%X -> profile=%u",
+                                      idx, unit_obj, g_last_p0_profile);
+                    }
+                }
+                g_last_seen_unit[idx] = unit_obj;
+                ++idx;
             }
         }
     }
@@ -2084,6 +2208,10 @@ uint64_t __fastcall Hook_LoadLevelCoop(void* a1, void** a2, uint32_t a3, uint8_t
     g_opening_diag_ticks = 0;
     std::memset(g_overlap_sep_done, 0, sizeof(g_overlap_sep_done));
     g_cinematic_active.store(false);
+    g_has_p0_teleport = false;
+    g_has_p0_profile = false;
+    for (uint32_t& u : g_last_seen_unit) u = 0xFFFFFFFFu;
+    for (int32_t& ep : g_equipped_profile) ep = -1;
     {
         std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
         g_has_synced_mission_rules = false;
@@ -2450,6 +2578,19 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     ProbePattern(span, config, "LockstepInputBuffer", kSigLockstepInputBuffer);
     ProbePattern(span, config, "GameCreatePlayer", kSigGameCreatePlayer);
     ProbePattern(span, config, "CoopRespawnCheck", kSigCoopRespawnCheck);
+
+    if (!g_hooked_player_add_equipment) {
+        if (auto addr = ProbePattern(span, config, "PlayerAddEquipment", kSigPlayerAddEquipment)) {
+            if (HookManager::Instance().InstallHook(
+                    "H1::PlayerAddEquipment",
+                    *addr,
+                    reinterpret_cast<void*>(&Hook_PlayerAddEquipment),
+                    reinterpret_cast<void**>(&g_orig_player_add_equipment)
+                )) {
+                g_hooked_player_add_equipment = *addr;
+            }
+        }
+    }
 
     if (!g_fn_unit_exit_vehicle) {
         if (auto addr = ProbePattern(span, config, "UnitExitVehicle", kSigUnitExitVehicle)) {
@@ -2823,6 +2964,10 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     g_opening_diag_ticks = 0;
     std::memset(g_overlap_sep_done, 0, sizeof(g_overlap_sep_done));
     g_cinematic_active.store(false);
+    g_has_p0_teleport = false;
+    g_has_p0_profile = false;
+    for (uint32_t& u : g_last_seen_unit) u = 0xFFFFFFFFu;
+    for (int32_t& ep : g_equipped_profile) ep = -1;
     {
         std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
         g_has_synced_mission_rules = false;
@@ -2831,6 +2976,11 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);
         g_hooked_has_player = 0;
         g_orig_has_player = nullptr;
+    }
+    if (g_hooked_player_add_equipment) {
+        HookManager::Instance().RemoveHook(g_hooked_player_add_equipment);
+        g_hooked_player_add_equipment = 0;
+        g_orig_player_add_equipment = nullptr;
     }
     if (g_hooked_init_session) {
         HookManager::Instance().RemoveHook(g_hooked_init_session);
