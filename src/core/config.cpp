@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 
 namespace ce4p {
 
@@ -100,20 +101,21 @@ MissionSpawnConfig ParseMissionSpawnValue(const std::string& val,
 
 std::unordered_map<std::string, MissionSpawnConfig> DefaultMissionSpawns() {
     std::unordered_map<std::string, MissionSpawnConfig> m;
-    // Only p3 and p4 have default offsets; p1 and p2 stay on original spawns unless overridden.
-    // a10: Pillar of Autumn
+    // a10: Pillar of Autumn — p1 (host) starts locked in cryochamber
+    m["a10.p1"] = MissionSpawnConfig{true, false, 45, 0.0f, -1.3f, 0.0f, false, true};
     m["a10.p3"] = MissionSpawnConfig{true, false, 45, 0.0f, -0.8f, 0.05f, false, true};
     m["a10.p4"] = MissionSpawnConfig{true, false, 45, 0.0f, -1.2f, 0.05f, false, true};
-    // a30: Halo
+    // a30: Halo — p3/p4 overlap in intro cutscene
     m["a30.p3"] = MissionSpawnConfig{false, true, 45, 0.8f, 0.0f, 0.05f, true, true};
     m["a30.p4"] = MissionSpawnConfig{false, true, 45, -0.8f, 0.0f, 0.05f, true, true};
-    // a50: Truth and Reconciliation
+    // a50: Truth and Reconciliation — p1 (host) + extra players start seated in Pelican
+    m["a50.p1"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false, true};
     m["a50.p3"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false, true};
     m["a50.p4"] = MissionSpawnConfig{true, false, 45, 0.0f, 1.2f, 0.05f, false, true};
-    // c10: 343 Guilty Spark
+    // c10: 343 Guilty Spark — p3/p4 start seated in Pelican
     m["c10.p3"] = MissionSpawnConfig{true, false, 45, 0.0f, 0.8f, 0.05f, false, true};
     m["c10.p4"] = MissionSpawnConfig{true, false, 45, 0.0f, 1.2f, 0.05f, false, true};
-    // c40: Two Betrayals
+    // c40: Two Betrayals — p3/p4 overlap in Control Room
     m["c40.p3"] = MissionSpawnConfig{false, true, 45, 0.8f, 0.0f, 0.05f, false, true};
     m["c40.p4"] = MissionSpawnConfig{false, true, 45, -0.8f, 0.0f, 0.05f, false, true};
     return m;
@@ -147,6 +149,7 @@ ModConfig ParseConfigText(const std::string& text) {
     std::istringstream stream(text);
     std::string line;
     std::string section;
+    std::unordered_set<std::string> seen_spawns;
 
     while (std::getline(stream, line)) {
         // Strip inline comments starting with '#' or ';'
@@ -187,15 +190,20 @@ ModConfig ParseConfigText(const std::string& text) {
                     (dot != std::string::npos && map_key.size() == dot + 3 &&
                      map_key[dot + 1] == 'p' &&
                      map_key[dot + 2] >= '1' && map_key[dot + 2] <= '4');
+                const std::string mission_key = is_player_override ? map_key.substr(0, dot) : std::string();
                 MissionSpawnConfig base{};
-                if (const auto it = cfg.mission_spawns.find(map_key); it != cfg.mission_spawns.end()) {
+                if (seen_spawns.count(map_key)) {
+                    base = cfg.mission_spawns[map_key];
+                } else if (is_player_override && seen_spawns.count(mission_key)) {
+                    base = cfg.mission_spawns[mission_key];
+                } else if (const auto it = cfg.mission_spawns.find(map_key); it != cfg.mission_spawns.end()) {
                     base = it->second;
                 } else if (is_player_override) {
-                    const std::string mission_key = map_key.substr(0, dot);
                     if (const auto mit = cfg.mission_spawns.find(mission_key); mit != cfg.mission_spawns.end()) {
                         base = mit->second;
                     }
                 }
+                seen_spawns.insert(map_key);
                 cfg.mission_spawns[map_key] = ParseMissionSpawnValue(val, base, is_player_override);
             }
             continue;
