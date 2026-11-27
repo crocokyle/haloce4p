@@ -160,7 +160,9 @@ BOOL CALLBACK DoEarlyInit(PINIT_ONCE /*init_once*/, PVOID /*param*/, PVOID* /*co
 
     {
         std::lock_guard<std::mutex> lock(g_config_mutex);
-        g_config = ce4p::LoadConfigFile(g_base_dir + "ce_4player.ini");
+        const std::string ini_path = g_base_dir + "ce_4player.ini";
+        g_config = ce4p::LoadConfigFile(ini_path);
+        ce4p::h1::SetConfigPath(ini_path);
     }
 
     ce4p::Logger::Instance().Init(g_base_dir + "ce_4player.log", g_config.alloc_console);

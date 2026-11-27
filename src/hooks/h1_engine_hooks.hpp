@@ -5,6 +5,9 @@
 
 namespace ce4p::h1 {
 
+// Sets the path to ce_4player.ini for automatic hot-reload on mission launch.
+void SetConfigPath(const std::string& path);
+
 // Called when halo1.dll is loaded by MCC.
 void OnModuleLoaded(const ModuleSnapshot& snapshot, const ModConfig& config);
 

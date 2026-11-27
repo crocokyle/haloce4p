@@ -6,6 +6,20 @@
 
 namespace ce4p {
 
+struct MissionSpawnConfig {
+    bool eject = false;
+    bool separate = false;
+    int delay_ticks = 45;
+    float offset_x = 0.0f;
+    float offset_y = 0.8f;
+    float offset_z = 0.05f;
+    bool during_cutscene = false;
+    bool custom_offset = false;
+};
+
+// Returns the built-in per-mission spawn defaults (a10, a30, a50, c10, c40).
+std::unordered_map<std::string, MissionSpawnConfig> DefaultMissionSpawns();
+
 struct ModConfig {
     bool alloc_console = true;
     int target_max_players = 4;
@@ -20,7 +34,11 @@ struct ModConfig {
     // Allows testing newly discovered signatures without recompiling version.dll.
     std::unordered_map<std::string, std::string> signature_overrides;
 
+    // Per-mission opening seat-eject / overlap-separation rules loaded from [MissionSpawns].
+    std::unordered_map<std::string, MissionSpawnConfig> mission_spawns = DefaultMissionSpawns();
+
     std::string GetSignature(const std::string& key, const char* fallback) const;
+    MissionSpawnConfig GetMissionSpawn(const std::string& map_name, int player_index = -1) const;
 };
 
 // Parses an INI string (portable, used by both Windows loader and unit tests).

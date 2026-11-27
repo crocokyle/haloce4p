@@ -5,9 +5,12 @@
 #include "core/memory_patch.hpp"
 #include "core/pattern_scanner.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <optional>
 
@@ -288,6 +291,78 @@ bool g_opening_eject_done[4]{};
 bool g_player_ever_on_foot[4]{};
 int32_t g_player_stuck_ticks[4]{};
 int32_t g_opening_diag_ticks = 0;
+bool g_overlap_sep_done[4]{};
+std::atomic<bool> g_cinematic_active{false};
+
+std::mutex g_mission_spawns_mu;
+std::string g_config_path;
+std::string g_spawns_config_path;
+std::unordered_map<std::string, MissionSpawnConfig> g_mission_spawns = DefaultMissionSpawns();
+MissionSpawnConfig g_synced_mission_rules[4]{};
+bool g_has_synced_mission_rules = false;
+
+void ReloadMissionSpawnsFromDisk() {
+    std::string spawns_path;
+    std::string cfg_path;
+    {
+        std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+        spawns_path = g_spawns_config_path;
+        cfg_path = g_config_path;
+    }
+    std::string chosen;
+    if (!spawns_path.empty() && std::ifstream(spawns_path).good()) {
+        chosen = spawns_path;
+    } else if (!cfg_path.empty() && std::ifstream(cfg_path).good()) {
+        chosen = cfg_path;
+    }
+    if (chosen.empty()) {
+        return;
+    }
+    ModConfig fresh = LoadConfigFile(chosen);
+    std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+    g_mission_spawns = std::move(fresh.mission_spawns);
+    CE4P_LOG_INFO("[H1] Reloaded mission spawns from %s", chosen.c_str());
+}
+
+uint32_t EncodeSpawnCoord(float v) {
+    return static_cast<uint32_t>(std::clamp(static_cast<int>(std::lround((v + 20.0f) * 100.0f)), 0, 4000));
+}
+
+float DecodeSpawnCoord(uint32_t enc) {
+    return (static_cast<float>(enc) / 100.0f) - 20.0f;
+}
+
+bool GetMissionSpawnRules(const char* map_name, MissionSpawnConfig out[4]) {
+    if (!map_name || !map_name[0]) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+    if (g_has_synced_mission_rules) {
+        bool any_active = false;
+        for (int i = 0; i < 4; ++i) {
+            out[i] = g_synced_mission_rules[i];
+            if (out[i].eject || out[i].separate) {
+                any_active = true;
+            }
+        }
+        return any_active;
+    }
+    std::string key(map_name);
+    for (char& c : key) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const auto base_it = g_mission_spawns.find(key);
+    const MissionSpawnConfig base = (base_it != g_mission_spawns.end()) ? base_it->second : MissionSpawnConfig{};
+    bool any_active = false;
+    for (int i = 0; i < 4; ++i) {
+        const auto pit = g_mission_spawns.find(key + ".p" + std::to_string(i));
+        out[i] = (pit != g_mission_spawns.end()) ? pit->second : base;
+        if (out[i].eject || out[i].separate) {
+            any_active = true;
+        }
+    }
+    return any_active;
+}
 
 bool GetUnitSeatAndPos(uint32_t unit_datum, uint32_t& out_parent, int16_t& out_seat, float out_pos[3]) {
     out_parent = 0xFFFFFFFFu;
@@ -1215,6 +1290,11 @@ void __fastcall Hook_ScriptEventDispatch(uint32_t* ev) {
         uint32_t id = *ev;
         const char* name = LookupEventName(id);
         is_start_game = (strcmp(name, "Request_StartGame") == 0);
+        if (id == 0x55) {
+            g_cinematic_active.store(true);
+        } else if (id == 0x56) {
+            g_cinematic_active.store(false);
+        }
         if (g_log_script_events.load()) {
             static std::atomic<uint64_t> seen_mask{0};
             uint32_t bucket = id & 63u;
@@ -1621,6 +1701,27 @@ void __fastcall Hook_SerializeLockstepVTable(void* factory, uint8_t** frame_6c_p
     }
     g_fn_serialize_action(copy.p2_swizzled, bitstream);
     g_fn_serialize_action(copy.p3_swizzled, bitstream);
+    if (g_fn_bitstream_write_int) {
+        const uint32_t send_spawns = (tick < 30 && g_current_map_name[0] != '\0') ? 1u : 0u;
+        g_fn_bitstream_write_int(bitstream, send_spawns, 1);
+        if (send_spawns) {
+            MissionSpawnConfig rules[4]{};
+            GetMissionSpawnRules(g_current_map_name, rules);
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t flags =
+                    (rules[i].eject ? 1u : 0u) |
+                    (rules[i].separate ? 2u : 0u) |
+                    (rules[i].during_cutscene ? 4u : 0u) |
+                    (rules[i].custom_offset ? 8u : 0u);
+                const uint32_t delay = static_cast<uint32_t>(std::clamp(rules[i].delay_ticks, 0, 1000));
+                g_fn_bitstream_write_int(bitstream, flags, 15);
+                g_fn_bitstream_write_int(bitstream, delay, 1000);
+                g_fn_bitstream_write_int(bitstream, EncodeSpawnCoord(rules[i].offset_x), 4000);
+                g_fn_bitstream_write_int(bitstream, EncodeSpawnCoord(rules[i].offset_y), 4000);
+                g_fn_bitstream_write_int(bitstream, EncodeSpawnCoord(rules[i].offset_z), 4000);
+            }
+        }
+    }
 }
 
 void __fastcall Hook_DeserializeLockstepVTable(void* factory, void* bitstream, uint8_t** frame_6c_ptr) {
@@ -1633,6 +1734,37 @@ void __fastcall Hook_DeserializeLockstepVTable(void* factory, void* bitstream, u
     entry.valid = true;
     g_fn_deserialize_action(entry.p2_swizzled, bitstream);
     g_fn_deserialize_action(entry.p3_swizzled, bitstream);
+    if (g_fn_bitstream_read_int) {
+        uint32_t has_spawns = 0;
+        g_fn_bitstream_read_int(bitstream, &has_spawns, 1);
+        if (has_spawns) {
+            MissionSpawnConfig synced[4]{};
+            for (int i = 0; i < 4; ++i) {
+                uint32_t flags = 0, delay = 45, ox = 2000, oy = 2000, oz = 2005;
+                g_fn_bitstream_read_int(bitstream, &flags, 15);
+                g_fn_bitstream_read_int(bitstream, &delay, 1000);
+                g_fn_bitstream_read_int(bitstream, &ox, 4000);
+                g_fn_bitstream_read_int(bitstream, &oy, 4000);
+                g_fn_bitstream_read_int(bitstream, &oz, 4000);
+                synced[i].eject = (flags & 1u) != 0;
+                synced[i].separate = (flags & 2u) != 0;
+                synced[i].during_cutscene = (flags & 4u) != 0;
+                synced[i].custom_offset = (flags & 8u) != 0;
+                synced[i].delay_ticks = static_cast<int>(delay);
+                synced[i].offset_x = DecodeSpawnCoord(ox);
+                synced[i].offset_y = DecodeSpawnCoord(oy);
+                synced[i].offset_z = DecodeSpawnCoord(oz);
+            }
+            std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+            for (int i = 0; i < 4; ++i) {
+                g_synced_mission_rules[i] = synced[i];
+            }
+            if (!g_has_synced_mission_rules) {
+                g_has_synced_mission_rules = true;
+                CE4P_LOG_INFO("[H1] Received host MissionSpawns for %s (tick=%u)", g_current_map_name, entry.tick_num);
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(g_lockstep_mutex);
     g_extra_lockstep_ring[entry.tick_num & (kExtraLockstepRingSize - 1)] = entry;
 }
@@ -1781,10 +1913,10 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
         }
     }
 
-    // Deterministic opening-seat fix (a10 cryotube, a50/c10 Pelican, etc.): for any player 0..3
-    // who has never been on foot yet and remains seated while at least one other player is on foot
-    // for 1.5s (45 ticks), force-eject them and move them next to the on-foot player identically on all peers.
-    if ((*valid_mask_ptr & 0x1u) != 0 && g_fn_unit_exit_seat_force && g_players_array_ptr && g_fn_datum_next) {
+    // Per-mission & per-player deterministic spawn fixes (opening seat eject & overlapping spawn separation).
+    MissionSpawnConfig player_rules[4]{};
+    if (GetMissionSpawnRules(g_current_map_name, player_rules) && (*valid_mask_ptr & 0x1u) != 0 &&
+        g_fn_unit_exit_seat_force && g_players_array_ptr && g_fn_datum_next) {
         const uint8_t* players_arr = *g_players_array_ptr;
         if (players_arr) {
             const int32_t data_off = *reinterpret_cast<const int32_t*>(players_arr + kDataArrayOffsetToData);
@@ -1804,8 +1936,20 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                 ++count;
             }
 
+            if (g_opening_diag_ticks == 0) {
+                CE4P_LOG_INFO("[H1] SpawnDiag(%s tick=%d count=%d): p0(eject=%d sep=%d u=0x%X par=0x%X seat=%d) p1(u=0x%X par=0x%X seat=%d) p2(u=0x%X par=0x%X seat=%d)",
+                              g_current_map_name, g_opening_diag_ticks, count,
+                              player_rules[0].eject ? 1 : 0, player_rules[0].separate ? 1 : 0,
+                              units[0], parents[0], seats[0],
+                              units[1], parents[1], seats[1],
+                              units[2], parents[2], seats[2]);
+            }
+
             if (count >= 2) {
-                ++g_opening_diag_ticks;
+                const bool cinematic = g_cinematic_active.load();
+                if (!cinematic) {
+                    ++g_opening_diag_ticks;
+                }
                 int ref_idx = -1;
                 for (int i = 0; i < count; ++i) {
                     if (valid_unit[i] && parents[i] == 0xFFFFFFFFu && seats[i] == -1) {
@@ -1814,19 +1958,32 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                     }
                 }
                 for (int i = 0; i < count; ++i) {
-                    if (!valid_unit[i]) {
+                    const MissionSpawnConfig& rule = player_rules[i];
+                    if (!rule.eject || !valid_unit[i]) {
                         continue;
                     }
-                    if (g_opening_diag_ticks > 300 && parents[i] == 0xFFFFFFFFu && seats[i] == -1) {
+                    if (!cinematic && g_opening_diag_ticks > 300 && parents[i] == 0xFFFFFFFFu && seats[i] == -1) {
                         g_player_ever_on_foot[i] = true;
                     } else if (!g_player_ever_on_foot[i] && !g_opening_eject_done[i] &&
                                parents[i] != 0xFFFFFFFFu && seats[i] != -1 && ref_idx != -1) {
                         ++g_player_stuck_ticks[i];
-                        if (g_player_stuck_ticks[i] >= 45) {
+                        if (g_player_stuck_ticks[i] >= rule.delay_ticks) {
                             g_fn_unit_exit_seat_force(units[i], false, false, true);
-                            const float side = (i % 2 == 0) ? 1.0f : -1.0f;
-                            const float mag = 0.8f + 0.4f * static_cast<float>(i / 2);
-                            float target_pos[3]{pos[ref_idx][0], pos[ref_idx][1] + side * mag, pos[ref_idx][2] + 0.05f};
+                            float dx = rule.offset_x;
+                            float dy = rule.offset_y;
+                            if (!rule.custom_offset) {
+                                const float side = (i % 2 == 0) ? 1.0f : -1.0f;
+                                const float extra = 0.4f * static_cast<float>(i / 2);
+                                dx = side * rule.offset_x;
+                                dy = side * ((rule.offset_y >= 0.0f)
+                                    ? (rule.offset_y + extra)
+                                    : (rule.offset_y - extra));
+                            }
+                            float target_pos[3]{
+                                pos[ref_idx][0] + dx,
+                                pos[ref_idx][1] + dy,
+                                pos[ref_idx][2] + rule.offset_z
+                            };
                             if (g_fn_object_set_position) {
                                 g_fn_object_set_position(units[i], target_pos, nullptr, 0);
                             }
@@ -1835,11 +1992,62 @@ void __fastcall Hook_CoopApplyActions(uint8_t* actions_4p, uint32_t* valid_mask_
                             }
                             g_opening_eject_done[i] = true;
                             CE4P_LOG_INFO("[H1] OpeningSeatEject(%s): ForceExit + Move(p%d=0x%X -> ref=p%d %.2f, %.2f, %.2f)",
-                                          g_current_map_name[0] ? g_current_map_name : "?",
+                                          g_current_map_name,
                                           i, units[i], ref_idx, target_pos[0], target_pos[1], target_pos[2]);
                         }
                     } else {
                         g_player_stuck_ticks[i] = 0;
+                    }
+                }
+
+                if (g_fn_object_set_position) {
+                    const bool cinematic = g_cinematic_active.load();
+                    for (int j = 1; j < count; ++j) {
+                        const MissionSpawnConfig& rule = player_rules[j];
+                        if (!rule.separate || g_overlap_sep_done[j] || (cinematic && !rule.during_cutscene)) {
+                            continue;
+                        }
+                        if (!valid_unit[j] || parents[j] != 0xFFFFFFFFu || seats[j] != -1) {
+                            continue;
+                        }
+                        for (int i = 0; i < j; ++i) {
+                            if (!valid_unit[i] || parents[i] != 0xFFFFFFFFu || seats[i] != -1) {
+                                continue;
+                            }
+                            const float dx = pos[j][0] - pos[i][0];
+                            const float dy = pos[j][1] - pos[i][1];
+                            const float dz = pos[j][2] - pos[i][2];
+                            if ((dx * dx + dy * dy) < 0.25f && (dz > -1.0f && dz < 1.0f)) {
+                                float ox = rule.offset_x;
+                                float oy = rule.offset_y;
+                                if (!rule.custom_offset) {
+                                    if (j == 2) {
+                                        ox = -rule.offset_x;
+                                        oy = -rule.offset_y;
+                                    } else if (j == 3) {
+                                        ox = -rule.offset_y;
+                                        oy = rule.offset_x;
+                                    }
+                                }
+                                float target_pos[3]{
+                                    pos[i][0] + ox,
+                                    pos[i][1] + oy,
+                                    pos[i][2] + rule.offset_z
+                                };
+                                g_fn_object_set_position(units[j], target_pos, nullptr, 0);
+                                if (g_fn_post_teleport) {
+                                    g_fn_post_teleport(units[j]);
+                                }
+                                pos[j][0] = target_pos[0];
+                                pos[j][1] = target_pos[1];
+                                pos[j][2] = target_pos[2];
+                                g_overlap_sep_done[j] = true;
+                                CE4P_LOG_INFO("[H1] OverlapSep(%s): moved p%d=0x%X away from p%d -> %.2f, %.2f, %.2f",
+                                              g_current_map_name, j, units[j], i,
+                                              target_pos[0], target_pos[1], target_pos[2]);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1864,11 +2072,22 @@ uint64_t __fastcall Hook_LoadLevelCoop(void* a1, void** a2, uint32_t a3, uint8_t
     );
     LogStackTrace("LoadLevelCoop");
     ResetLockstepMultiplexState();
+    {
+        std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+        g_has_synced_mission_rules = false;
+    }
+    ReloadMissionSpawnsFromDisk();
     std::snprintf(g_current_map_name, sizeof(g_current_map_name), "%s", map_str ? map_str : "?");
     std::memset(g_opening_eject_done, 0, sizeof(g_opening_eject_done));
     std::memset(g_player_ever_on_foot, 0, sizeof(g_player_ever_on_foot));
     std::memset(g_player_stuck_ticks, 0, sizeof(g_player_stuck_ticks));
     g_opening_diag_ticks = 0;
+    std::memset(g_overlap_sep_done, 0, sizeof(g_overlap_sep_done));
+    g_cinematic_active.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+        g_has_synced_mission_rules = false;
+    }
 
     uint64_t ret = g_orig_load_level_coop(a1, a2, a3, a4_is_new, a5_is_online);
 
@@ -1984,6 +2203,10 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
     g_h1_base = snapshot.base;
     g_force_test_players = config.force_test_player_count;
     g_enable_catchup_teleport = config.enable_catchup_teleport;
+    {
+        std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+        g_mission_spawns = config.mission_spawns;
+    }
 
     MemorySpan span{
         reinterpret_cast<const uint8_t*>(snapshot.base),
@@ -2492,6 +2715,14 @@ void ScanSnapshot(const ModuleSnapshot& snapshot, const ModConfig& config) {
 
 }  // namespace
 
+void SetConfigPath(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+    g_config_path = path;
+    const size_t slash = path.find_last_of("\\/");
+    const std::string dir = (slash == std::string::npos) ? std::string() : path.substr(0, slash + 1);
+    g_spawns_config_path = dir + "ce_4player_spawns.ini";
+}
+
 void OnModuleLoaded(const ModuleSnapshot& snapshot, const ModConfig& config) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     g_active_snapshot = snapshot;
@@ -2590,6 +2821,12 @@ void OnModuleUnloaded(const ModuleSnapshot& /*snapshot*/) {
     std::memset(g_player_ever_on_foot, 0, sizeof(g_player_ever_on_foot));
     std::memset(g_player_stuck_ticks, 0, sizeof(g_player_stuck_ticks));
     g_opening_diag_ticks = 0;
+    std::memset(g_overlap_sep_done, 0, sizeof(g_overlap_sep_done));
+    g_cinematic_active.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_mission_spawns_mu);
+        g_has_synced_mission_rules = false;
+    }
     if (g_hooked_has_player) {
         HookManager::Instance().RemoveHook(g_hooked_has_player);
         g_hooked_has_player = 0;

@@ -50,22 +50,24 @@ jobs:
           mkdir -p dist
           cp build-win64/version.dll dist/version.dll
           cp ce_4player.ini dist/ce_4player.ini
+          cp ce_4player_spawns.ini dist/ce_4player_spawns.ini
           cat << 'EOF' > dist/INSTALL.md
           # Halo: CE 4-Player Co-op Mod (MCC)
 
           One package works for both **Windows** and **Linux (Steam Proton)**.
 
-          1. Copy **both** files into your MCC Win64 folder:
+          1. Copy **all three** files into your MCC Win64 folder:
              `<Halo The Master Chief Collection>/MCC/Binaries/Win64/`
              - `version.dll`
              - `ce_4player.ini`
+             - `ce_4player_spawns.ini`
           2. Launch MCC with **Easy Anti-Cheat disabled**:
              - **Windows:** Choose *"Play Halo: MCC (Anti-Cheat Disabled)"* in Steam (or pass `-no-eac`).
              - **Linux (Steam Proton):** Set Steam Launch Options to:
                ```
                WINEDLLOVERRIDES="version=n,b" %command% -no-eac
                ```
-          3. All co-op players should have `version.dll` and `ce_4player.ini` installed.
+          3. All co-op players should have `version.dll` and `ce_4player.ini` installed. Only the host's `ce_4player_spawns.ini` is used and is synced automatically to clients.
           EOF
 
           TAG_NAME="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
@@ -74,7 +76,7 @@ jobs:
           else
             ARCHIVE_NAME="haloce4p-dev.zip"
           fi
-          (cd dist && zip -r "../${ARCHIVE_NAME}" version.dll ce_4player.ini INSTALL.md)
+          (cd dist && zip -r "../${ARCHIVE_NAME}" version.dll ce_4player.ini ce_4player_spawns.ini INSTALL.md)
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
 
